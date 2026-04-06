@@ -22,7 +22,7 @@ class Apriltag {
         // detector options
         this._opt = {
           // Decimate input image by this factor
-          quad_decimate: 2.0,
+          quad_decimate: 1.0,
           // What Gaussian blur should be applied to the segmented image; standard deviation in pixels
           quad_sigma: 0.0,
            // Use this many CPU threads (no effect)

@@ -1,25 +1,50 @@
 "use client";
 
 import * as Comlink from "comlink";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 type ApriltagApi = {
   detect: (
     grayscale: Uint8Array,
     w: number,
     h: number,
-  ) => Promise<Array<{ id: number }>>;
+  ) => Promise<unknown>;
   set_tag_size: (tagid: number, size: number) => Promise<void>;
   set_camera_info: (fx: number, fy: number, cx: number, cy: number) => Promise<void>;
 };
+
+function parseDetectionIds(detections: unknown): number[] {
+  if (Array.isArray(detections)) {
+    return detections
+      .map((det) => {
+        if (det && typeof det === "object" && "id" in det) {
+          const id = (det as { id: unknown }).id;
+          return typeof id === "number" ? id : Number(id);
+        }
+        return NaN;
+      })
+      .filter((n) => Number.isFinite(n));
+  }
+  if (detections && typeof detections === "object" && "tags" in detections) {
+    return parseDetectionIds((detections as { tags: unknown }).tags);
+  }
+  return [];
+}
 
 export function useAprilTagDetector(
   getVideo: () => HTMLVideoElement | null,
   onTagIds: (ids: number[]) => void,
   enabled: boolean,
+  onDebug?: (message: string) => void,
 ) {
   const rafRef = useRef<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const onTagIdsRef = useRef(onTagIds);
+  const onDebugRef = useRef(onDebug);
+  useLayoutEffect(() => {
+    onTagIdsRef.current = onTagIds;
+    onDebugRef.current = onDebug;
+  }, [onTagIds, onDebug]);
 
   const stopLoop = useCallback(() => {
     if (rafRef.current != null) {
@@ -35,6 +60,15 @@ export function useAprilTagDetector(
     }
 
     let cancelled = false;
+    let lastDbg = "";
+    let lastDbgAt = 0;
+    const dbg = (s: string) => {
+      const t = Date.now();
+      if (s === lastDbg && t - lastDbgAt < 400) return;
+      lastDbg = s;
+      lastDbgAt = t;
+      onDebugRef.current?.(s);
+    };
     const worker = new Worker("/apriltag/apriltag.js");
     const RemoteApriltag = Comlink.wrap<new (cb: () => void) => ApriltagApi>(worker);
 
@@ -72,12 +106,11 @@ export function useAprilTagDetector(
             gray[j] = Math.round((d[i]! + d[i + 1]! + d[i + 2]!) / 3);
           }
           const detections = await api.detect(gray, w, h);
-          const ids = Array.isArray(detections)
-            ? detections.map((det) => det.id)
-            : [];
-          onTagIds(ids);
-        } catch {
-          /* ignore frame errors */
+          const ids = parseDetectionIds(detections);
+          onTagIdsRef.current(ids);
+          dbg(ids.length ? `Tags: ${ids.join(", ")}` : "kein Tag");
+        } catch (e) {
+          dbg(`Fehler: ${e instanceof Error ? e.message : "Scan"}`);
         }
         rafRef.current = requestAnimationFrame(tick);
       };
@@ -101,6 +134,7 @@ export function useAprilTagDetector(
                 const cy = video.videoHeight / 2;
                 await instance.set_camera_info(fx, fy, cx, cy);
               }
+              dbg("AprilTag bereit");
               startLoop(instance);
             })();
           }),
@@ -108,6 +142,7 @@ export function useAprilTagDetector(
         if (cancelled) return;
       } catch (e) {
         console.error("AprilTag-Worker Start fehlgeschlagen", e);
+        dbg("Worker-Start fehlgeschlagen (Konsole)");
       }
     })();
 
@@ -116,5 +151,5 @@ export function useAprilTagDetector(
       stopLoop();
       worker.terminate();
     };
-  }, [enabled, getVideo, onTagIds, stopLoop]);
+  }, [enabled, getVideo, stopLoop]);
 }
