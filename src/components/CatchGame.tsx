@@ -12,6 +12,7 @@ import {
 } from "react";
 import Webcam from "react-webcam";
 import { useAprilTagDetector } from "@/components/AprilTagDetector";
+import { DroneJamOverlay } from "@/components/DroneJamOverlay";
 import type { StormCircle } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
@@ -40,6 +41,8 @@ type RosterInfo = {
 const LOCATION_STORAGE_KEY = "catch-game-use-location";
 const STORM_RADIUS_M = 5000;
 const STORM_COOLDOWN_MS = 25_000;
+const DRONE_JAM_DURATION_MS = 20_000;
+const DRONE_JAM_COOLDOWN_MS = 35_000;
 
 type ViewMode = "map" | "camera";
 
@@ -68,11 +71,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [stormMode, setStormMode] = useState(false);
   const [stormCircles, setStormCircles] = useState<StormCircle[]>([]);
   const [stormCooldownUntil, setStormCooldownUntil] = useState(0);
+  const [droneJamCooldownUntil, setDroneJamCooldownUntil] = useState(0);
+  /** Ende der Störung (ms seit Epoch); 0 = keine aktive Störung. */
+  const [jamEndsAt, setJamEndsAt] = useState(0);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
   const lastCatchByVictim = useRef<Record<string, number>>({});
   const gameEndSentRef = useRef(false);
+  const processedDroneJamIdsRef = useRef<string[]>([]);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
 
@@ -259,6 +266,14 @@ export function CatchGame({ roomId }: { roomId: string }) {
           return next;
         });
       }
+      if (msg.type === "drone_jam") {
+        if (msg.casterPlayerId === playerId) return;
+        const seen = processedDroneJamIdsRef.current;
+        if (seen.includes(msg.jamEventId)) return;
+        seen.push(msg.jamEventId);
+        if (seen.length > 48) seen.splice(0, seen.length - 48);
+        setJamEndsAt((prev) => Math.max(prev, msg.endsAt));
+      }
     });
 
     return () => {
@@ -277,6 +292,36 @@ export function CatchGame({ roomId }: { roomId: string }) {
     setView("map");
     setStormMode(true);
   }, [canPlay, iAmCaught, winnerId, stormCooldownUntil]);
+
+  const sendDroneJam = useCallback(() => {
+    if (!canPlay || iAmCaught || winnerId) return;
+    if (nowTick < droneJamCooldownUntil) return;
+    const ts = Date.now();
+    const jamEventId = `${playerId}-${ts}`;
+    const endsAt = ts + DRONE_JAM_DURATION_MS;
+    setDroneJamCooldownUntil(ts + DRONE_JAM_COOLDOWN_MS);
+    publish({
+      type: "drone_jam",
+      roomId: roomKey,
+      jamEventId,
+      casterPlayerId: playerId,
+      endsAt,
+      ts,
+    });
+  }, [
+    canPlay,
+    iAmCaught,
+    winnerId,
+    nowTick,
+    droneJamCooldownUntil,
+    playerId,
+    roomKey,
+    publish,
+  ]);
+
+  const droneJamOnCooldown = nowTick < droneJamCooldownUntil;
+  const jamActive = jamEndsAt > nowTick;
+  const jamSecondsLeft = jamActive ? Math.max(0, Math.ceil((jamEndsAt - nowTick) / 1000)) : 0;
 
   const huntTagIds = useMemo(() => {
     if (!roster) return [];
@@ -480,7 +525,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const showLocationModal = locationHydrated && locationConsent === null;
 
   return (
-    <div className="flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
+    <div className="relative flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
+      <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
       {showLocationModal && (
         <div
           className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
@@ -712,6 +758,21 @@ export function CatchGame({ roomId }: { roomId: string }) {
             {stormOnCooldown
               ? `Sturm (${Math.max(0, Math.ceil((stormCooldownUntil - nowTick) / 1000))} s)`
               : "Sturm"}
+          </button>
+          <button
+            type="button"
+            onClick={sendDroneJam}
+            disabled={!canPlay || iAmCaught || !!winnerId || droneJamOnCooldown}
+            title={
+              droneJamOnCooldown
+                ? `Drohnen-Störung abklingend (${Math.ceil((droneJamCooldownUntil - nowTick) / 1000)} s)`
+                : "Andere Spieler sehen 20 s lang nur Rauschen (du nicht)."
+            }
+            className="w-full rounded-lg px-4 py-3 text-sm font-medium transition enabled:bg-amber-700 enabled:text-white enabled:hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+          >
+            {droneJamOnCooldown
+              ? `Drohnen-Störung (${Math.max(0, Math.ceil((droneJamCooldownUntil - nowTick) / 1000))} s)`
+              : "Drohnen-Störung"}
           </button>
           <div className="flex gap-2">
             <button

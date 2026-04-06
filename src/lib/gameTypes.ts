@@ -38,6 +38,15 @@ export type GameMessage =
       ts: number;
       /** @deprecated nur noch für alte Clients / Logs */
       loserPlayerId?: string;
+    }
+  | {
+      type: "drone_jam";
+      roomId: string;
+      jamEventId: string;
+      casterPlayerId: string;
+      /** Zeitstempel (ms), zu dem die Störung endet (Sender-Uhr). */
+      endsAt: number;
+      ts: number;
     };
 
 export function parseGameMessage(raw: string): GameMessage | null {
