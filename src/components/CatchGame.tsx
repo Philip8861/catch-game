@@ -44,6 +44,11 @@ const STORM_COOLDOWN_MS = 25_000;
 const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
+const MAX_HP = 1000;
+const HP_DRAIN_PER_SEC = 50;
+const TAG_LOCK_TTL_MS = 450;
+const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
+
 type ViewMode = "map" | "camera";
 
 function topicForRoom(roomKey: string) {
@@ -74,12 +79,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [droneJamCooldownUntil, setDroneJamCooldownUntil] = useState(0);
   /** Ende der Störung (ms seit Epoch); 0 = keine aktive Störung. */
   const [jamEndsAt, setJamEndsAt] = useState(0);
+  const [hpDisplay, setHpDisplay] = useState(MAX_HP);
+  const [tagBeamActive, setTagBeamActive] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
   const lastCatchByVictim = useRef<Record<string, number>>({});
   const gameEndSentRef = useRef(false);
   const processedDroneJamIdsRef = useRef<string[]>([]);
+  const hpRef = useRef(MAX_HP);
+  const tagLockUntilRef = useRef(0);
+  const lastHpDamageAtRef = useRef(0);
+  const wasHpBeamLockedRef = useRef(false);
+  const prevTagBeamUiRef = useRef(false);
+  const lastTagLockScannerRef = useRef<string | null>(null);
+  const zeroHpHandledRef = useRef(false);
+  const lastTagLockPublishRef = useRef<Record<string, number>>({});
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
 
@@ -235,6 +250,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
         }));
       }
       if (msg.type === "player_caught") {
+        if (msg.caughtPlayerId === playerId) {
+          hpRef.current = 0;
+          setHpDisplay(0);
+          zeroHpHandledRef.current = true;
+        }
         setCaught((p) => {
           if (p[msg.caughtPlayerId]) return p;
           return { ...p, [msg.caughtPlayerId]: msg.catcherPlayerId };
@@ -273,6 +293,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
         seen.push(msg.jamEventId);
         if (seen.length > 48) seen.splice(0, seen.length - 48);
         setJamEndsAt((prev) => Math.max(prev, msg.endsAt));
+      }
+      if (msg.type === "tag_lock") {
+        if (msg.victimPlayerId !== playerId) return;
+        const t = Date.now();
+        tagLockUntilRef.current = t + TAG_LOCK_TTL_MS;
+        lastTagLockScannerRef.current = msg.scannerPlayerId;
       }
     });
 
@@ -330,6 +356,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
       .map((pid) => roster.playerToTag.get(pid)!)
       .filter((n) => Number.isFinite(n));
   }, [roster, playerId, caught]);
+
+  useEffect(() => {
+    if (roster) return;
+    hpRef.current = MAX_HP;
+    zeroHpHandledRef.current = false;
+    tagLockUntilRef.current = 0;
+    lastTagLockScannerRef.current = null;
+    lastTagLockPublishRef.current = {};
+    window.queueMicrotask(() => {
+      setHpDisplay(MAX_HP);
+    });
+  }, [roster]);
 
   useEffect(() => {
     if (!roster || winnerId) return;
@@ -468,6 +506,67 @@ export function CatchGame({ roomId }: { roomId: string }) {
     caughtRef.current = caught;
   }, [canPlay, winnerId, roster, caught]);
 
+  useEffect(() => {
+    lastHpDamageAtRef.current = Date.now();
+    let frame = 0;
+    let alive = true;
+    const step = () => {
+      if (!alive) return;
+      const now = Date.now();
+      const locked =
+        now < tagLockUntilRef.current &&
+        canPlayRef.current &&
+        !caughtRef.current[playerId] &&
+        !winnerIdRef.current;
+
+      if (wasHpBeamLockedRef.current !== locked) {
+        lastHpDamageAtRef.current = now;
+        wasHpBeamLockedRef.current = locked;
+      }
+      if (prevTagBeamUiRef.current !== locked) {
+        prevTagBeamUiRef.current = locked;
+        setTagBeamActive(locked);
+      }
+
+      if (locked && hpRef.current > 0) {
+        const dt = Math.min(0.2, (now - lastHpDamageAtRef.current) / 1000);
+        lastHpDamageAtRef.current = now;
+        if (dt > 0) {
+          hpRef.current = Math.max(0, hpRef.current - HP_DRAIN_PER_SEC * dt);
+          const rounded = Math.round(hpRef.current);
+          setHpDisplay((prev) => (prev !== rounded ? rounded : prev));
+          if (hpRef.current <= 0 && !zeroHpHandledRef.current) {
+            zeroHpHandledRef.current = true;
+            const catcher = lastTagLockScannerRef.current;
+            if (catcher && catcher !== playerId) {
+              publish({
+                type: "player_caught",
+                roomId: roomKey,
+                caughtPlayerId: playerId,
+                catcherPlayerId: catcher,
+                ts: now,
+              });
+              setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: catcher }));
+            } else {
+              zeroHpHandledRef.current = false;
+              hpRef.current = 1;
+              setHpDisplay(1);
+            }
+          }
+        }
+      } else {
+        lastHpDamageAtRef.current = now;
+      }
+
+      frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(frame);
+    };
+  }, [playerId, publish, roomKey]);
+
   const onTagIds = useCallback(
     (ids: number[]) => {
       if (!canPlayRef.current || winnerIdRef.current || caughtRef.current[playerId]) return;
@@ -479,6 +578,17 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (!victimId || victimId === playerId) continue;
         if (caughtRef.current[victimId]) continue;
         if (tid === r.myTagId) continue;
+        const lastPub = lastTagLockPublishRef.current[victimId] ?? 0;
+        if (now - lastPub >= TAG_LOCK_PUBLISH_INTERVAL_MS) {
+          lastTagLockPublishRef.current[victimId] = now;
+          publish({
+            type: "tag_lock",
+            roomId: roomKey,
+            scannerPlayerId: playerId,
+            victimPlayerId: victimId,
+            ts: now,
+          });
+        }
         const last = lastCatchByVictim.current[victimId] ?? 0;
         if (now - last < 2500) continue;
         lastCatchByVictim.current[victimId] = now;
@@ -493,6 +603,14 @@ export function CatchGame({ roomId }: { roomId: string }) {
           if (prev[victimId]) return prev;
           return { ...prev, [victimId]: playerId };
         });
+      }
+      for (const pid of r.sorted) {
+        if (pid === playerId) continue;
+        const tagNum = r.playerToTag.get(pid);
+        if (tagNum === undefined) continue;
+        if (!ids.includes(tagNum)) {
+          delete lastTagLockPublishRef.current[pid];
+        }
       }
     },
     [playerId, publish, roomKey],
@@ -622,6 +740,46 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </p>
         </div>
       </header>
+
+      {mqttStatus === "live" && roster && (
+        <div
+          className={`sticky top-0 z-[90] border-b px-4 py-2.5 ${
+            tagBeamActive
+              ? "border-red-800/80 bg-red-950/95"
+              : "border-zinc-800 bg-zinc-900/95"
+          } backdrop-blur-sm`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">HP</span>
+            <span className="font-mono text-sm tabular-nums text-zinc-100">
+              {hpDisplay} / {MAX_HP}
+            </span>
+          </div>
+          <div
+            className="mt-2 h-2.5 overflow-hidden rounded-full bg-zinc-800"
+            role="progressbar"
+            aria-valuenow={hpDisplay}
+            aria-valuemin={0}
+            aria-valuemax={MAX_HP}
+          >
+            <div
+              className={`h-full rounded-full transition-[width] duration-100 ${
+                hpDisplay > 600
+                  ? "bg-emerald-500"
+                  : hpDisplay > 300
+                    ? "bg-amber-500"
+                    : "bg-red-500"
+              } ${tagBeamActive ? "animate-pulse" : ""}`}
+              style={{ width: `${(hpDisplay / MAX_HP) * 100}%` }}
+            />
+          </div>
+          {tagBeamActive && (
+            <p className="mt-1.5 text-center text-[11px] font-medium text-red-200/90">
+              AprilTag im Visier eines Gegners – {HP_DRAIN_PER_SEC} HP/s
+            </p>
+          )}
+        </div>
+      )}
 
       {iAmCaught && !winnerId && (
         <div className="border-b border-orange-900/60 bg-orange-950/90 px-4 py-3 text-center text-sm text-orange-100">

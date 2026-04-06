@@ -47,6 +47,13 @@ export type GameMessage =
       /** Zeitstempel (ms), zu dem die Störung endet (Sender-Uhr). */
       endsAt: number;
       ts: number;
+    }
+  | {
+      type: "tag_lock";
+      roomId: string;
+      scannerPlayerId: string;
+      victimPlayerId: string;
+      ts: number;
     };
 
 export function parseGameMessage(raw: string): GameMessage | null {
