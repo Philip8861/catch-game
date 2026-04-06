@@ -31,7 +31,6 @@ function latLngBoundsKm(centerLat: number, centerLng: number, radiusKm: number) 
 }
 
 const VIEW_RADIUS_KM_SELF = 10;
-const FIT_SELF_THROTTLE_MS = 5000;
 
 function MapAccessor({ mapRef }: { mapRef: MutableRefObject<LeafletMap | null> }) {
   const map = useMap();
@@ -60,7 +59,11 @@ function StormClickLayer({
   return null;
 }
 
-/** Hält die Ansicht um die eigene Position auf ~10 km „Höhe“ (Sichtradius). */
+/**
+ * Einmaliger Fit auf ~10 km um die eigene Position, sobald GPS da ist.
+ * Kein wiederholtes fitBounds bei Positions-Updates – sonst würde Pinch/Zoom
+ * regelmäßig zurück auf 10 km springen.
+ */
 function AutoFitViewAroundSelf({
   myPos,
 }: {
@@ -68,23 +71,17 @@ function AutoFitViewAroundSelf({
 }) {
   const map = useMap();
   const didInitial = useRef(false);
-  const lastFitAt = useRef(0);
 
   useEffect(() => {
-    if (!myPos) return;
-    const now = Date.now();
-    const bounds = latLngBoundsKm(myPos.lat, myPos.lng, VIEW_RADIUS_KM_SELF);
-
-    if (!didInitial.current) {
-      didInitial.current = true;
-      lastFitAt.current = now;
-      map.fitBounds(bounds, { padding: [28, 28], maxZoom: 13, animate: false });
+    if (!myPos) {
+      didInitial.current = false;
       return;
     }
+    if (didInitial.current) return;
 
-    if (now - lastFitAt.current < FIT_SELF_THROTTLE_MS) return;
-    lastFitAt.current = now;
-    map.fitBounds(bounds, { padding: [28, 28], maxZoom: 13, animate: true, duration: 0.4 });
+    didInitial.current = true;
+    const bounds = latLngBoundsKm(myPos.lat, myPos.lng, VIEW_RADIUS_KM_SELF);
+    map.fitBounds(bounds, { padding: [28, 28], maxZoom: 13, animate: false });
   }, [myPos, map]);
 
   return null;
@@ -164,7 +161,9 @@ export function GameMapView({
               weight: 3,
             }}
           >
-            <Tooltip direction="top">Sturm · {s.radiusM} m</Tooltip>
+            <Tooltip direction="top">
+              Sturm · {s.radiusM >= 1000 ? `${s.radiusM / 1000} km` : `${s.radiusM} m`}
+            </Tooltip>
           </Circle>
         ))}
         {myPos && (

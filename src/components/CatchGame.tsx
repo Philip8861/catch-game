@@ -38,7 +38,7 @@ type RosterInfo = {
 };
 
 const LOCATION_STORAGE_KEY = "catch-game-use-location";
-const STORM_RADIUS_M = 50;
+const STORM_RADIUS_M = 5000;
 const STORM_COOLDOWN_MS = 25_000;
 
 type ViewMode = "map" | "camera";
@@ -651,7 +651,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
         >
           {stormMode && (
             <div className="rounded-lg border border-violet-700/60 bg-violet-950/90 px-3 py-2 text-sm text-violet-100">
-              <strong>Sturm-Modus:</strong> Tippe auf die Karte, um einen Kreis mit 50&nbsp;m Radius zu
+              <strong>Sturm-Modus:</strong> Tippe auf die Karte, um einen Kreis mit 5&nbsp;km Radius zu
               setzen. Alle Spieler darin gelten als gefangen.{" "}
               <button
                 type="button"
@@ -688,9 +688,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       : "kein Fix – siehe Hinweis oben oder „Erneut versuchen“."}
           </p>
           <p className="text-xs text-zinc-600">
-            Karte: eigene Ansicht ~<strong className="text-zinc-400">10 km</strong> Radius um dich
-            (wird regelmäßig angepasst). <strong className="text-zinc-400">Spieler 1</strong> hat
-            einen sichtbaren Kreis mit <strong className="text-zinc-400">40 km</strong> Radius.
+            Karte: beim ersten GPS-Fix ~<strong className="text-zinc-400">10 km</strong> um dich; Zoom
+            und Verschieben bleiben erhalten („Zu mir (10 km)“ setzt die Ansicht zurück).{" "}
+            <strong className="text-zinc-400">Spieler 1</strong> hat einen sichtbaren Kreis mit{" "}
+            <strong className="text-zinc-400">40 km</strong> Radius.
           </p>
         </div>
       </div>
