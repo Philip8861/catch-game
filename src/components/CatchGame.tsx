@@ -526,7 +526,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
   return (
     <div className="relative flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
-      <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
       {showLocationModal && (
         <div
           className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
@@ -653,38 +652,42 @@ export function CatchGame({ roomId }: { roomId: string }) {
           }
           aria-hidden={view !== "camera"}
         >
-          <Webcam
-            ref={webcamRef}
-            audio={false}
-            mirrored={false}
-            videoConstraints={{
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              facingMode: { ideal: "environment" },
-            }}
-            className="h-full min-h-[50vh] w-full flex-1 object-cover"
-          />
-          <div
-            className="pointer-events-none absolute inset-0 z-[15] flex items-center justify-center"
-            aria-hidden
-          >
-            <div className="absolute left-1/2 top-0 bottom-0 w-[2px] -translate-x-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
-            <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
-            <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
-          </div>
-          {canPlay && !winnerId && roster && (
-            <div className="absolute bottom-4 left-4 right-4 rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
-              <p>
-                Dein AprilTag: <strong>ID {roster.myTagId}</strong> – zeige ihn den anderen. Du
-                darfst <strong>jeden anderen</strong> Spieler jagen (AprilTag seiner Nummer scannen).
-              </p>
-              <p className="mt-1 text-xs text-zinc-300">
-                Jagbare Tag-IDs jetzt:{" "}
-                <strong>{huntTagIds.length ? huntTagIds.join(", ") : "—"}</strong>
-                {roster.sorted.length > 2 && ` · ${roster.sorted.length} Spieler im Raum`}
-              </p>
+          <div className="relative min-h-[50vh] w-full flex-1 overflow-hidden bg-black">
+            <Webcam
+              ref={webcamRef}
+              audio={false}
+              mirrored={false}
+              videoConstraints={{
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                facingMode: { ideal: "environment" },
+              }}
+              className="h-full min-h-[50vh] w-full object-cover"
+            />
+            <div
+              className="pointer-events-none absolute inset-0 z-[15] flex items-center justify-center"
+              aria-hidden
+            >
+              <div className="absolute left-1/2 top-0 bottom-0 w-[2px] -translate-x-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+              <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+              <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
             </div>
-          )}
+            <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
+            {canPlay && !winnerId && roster && (
+              <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[20] rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
+                <p>
+                  Dein AprilTag: <strong>ID {roster.myTagId}</strong> – zeige ihn den anderen. Du
+                  darfst <strong>jeden anderen</strong> Spieler jagen (AprilTag seiner Nummer
+                  scannen).
+                </p>
+                <p className="mt-1 text-xs text-zinc-300">
+                  Jagbare Tag-IDs jetzt:{" "}
+                  <strong>{huntTagIds.length ? huntTagIds.join(", ") : "—"}</strong>
+                  {roster.sorted.length > 2 && ` · ${roster.sorted.length} Spieler im Raum`}
+                </p>
+              </div>
+            )}
+          </div>
         </div>
 
         <div
@@ -743,17 +746,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
       </div>
 
       <div className="border-t border-zinc-800 bg-zinc-900 px-4 py-3">
+        <p className="mb-2 text-center text-xs text-zinc-500">
+          Spezialaktionen <span className="text-zinc-400">(ganz unten, über Karte/Kamera)</span>
+        </p>
         <div className="flex flex-col gap-2">
           <button
             type="button"
             onClick={startStormMode}
             disabled={!canPlay || iAmCaught || !!winnerId || stormOnCooldown}
             title={
-              stormOnCooldown
-                ? `Sturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
-                : undefined
+              !canPlay && !winnerId
+                ? "Ab zwei Spielern im Raum nutzbar."
+                : stormOnCooldown
+                  ? `Sturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
+                  : undefined
             }
-            className="w-full rounded-lg px-4 py-3 text-sm font-medium transition enabled:bg-violet-700 enabled:text-white enabled:hover:bg-violet-600 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+            className="w-full rounded-lg border border-transparent px-4 py-3 text-sm font-medium transition enabled:border-violet-500/40 enabled:bg-violet-700 enabled:text-white enabled:hover:bg-violet-600 disabled:cursor-not-allowed disabled:border-violet-900/50 disabled:bg-violet-950/50 disabled:text-violet-200/70"
           >
             {stormOnCooldown
               ? `Sturm (${Math.max(0, Math.ceil((stormCooldownUntil - nowTick) / 1000))} s)`
@@ -764,11 +772,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
             onClick={sendDroneJam}
             disabled={!canPlay || iAmCaught || !!winnerId || droneJamOnCooldown}
             title={
-              droneJamOnCooldown
-                ? `Drohnen-Störung abklingend (${Math.ceil((droneJamCooldownUntil - nowTick) / 1000)} s)`
-                : "Andere Spieler sehen 20 s lang nur Rauschen (du nicht)."
+              !canPlay && !winnerId
+                ? "Ab zwei Spielern im Raum nutzbar."
+                : droneJamOnCooldown
+                  ? `Drohnen-Störung abklingend (${Math.ceil((droneJamCooldownUntil - nowTick) / 1000)} s)`
+                  : "Andere sehen 20 s nur Rauschen über dem Kamerabild (Karte & Steuerung bleiben normal)."
             }
-            className="w-full rounded-lg px-4 py-3 text-sm font-medium transition enabled:bg-amber-700 enabled:text-white enabled:hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+            className="w-full rounded-lg border border-transparent px-4 py-3 text-sm font-medium transition enabled:border-amber-500/40 enabled:bg-amber-700 enabled:text-white enabled:hover:bg-amber-600 disabled:cursor-not-allowed disabled:border-amber-900/60 disabled:bg-amber-950/50 disabled:text-amber-100/75"
           >
             {droneJamOnCooldown
               ? `Drohnen-Störung (${Math.max(0, Math.ceil((droneJamCooldownUntil - nowTick) / 1000))} s)`
@@ -803,6 +813,14 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
         </div>
         <div className="mt-3 space-y-1 text-xs text-zinc-500">
+          {!canPlay && !winnerId && (
+            <p className="text-amber-200/80">
+              <strong className="text-amber-100">Drohnen-Störung &amp; Sturm:</strong> sichtbar als
+              violette und orangefarbene Buttons oben in dieser Leiste – sie werden erst{" "}
+              <strong className="text-amber-50">klickbar</strong>, wenn mindestens{" "}
+              <strong className="text-amber-50">zwei Spieler</strong> online sind (gleicher Raumcode).
+            </p>
+          )}
           <p>
             Spieler online (TTL): <strong className="text-zinc-300">{activePlayers.length}</strong>
             {activePlayers.length < 2 && " – mindestens zwei Spieler für die Jagd."}

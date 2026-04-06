@@ -8,7 +8,8 @@ type Props = {
 };
 
 /**
- * Vollbild-Overlay: grauer Schleier + SVG-Rauschen, Countdown in Sekunden.
+ * Overlay nur über dem Kamerabild (Parent braucht `position: relative`).
+ * Grauer Schleier + SVG-Rauschen, Countdown in Sekunden.
  */
 export function DroneJamOverlay({ active, secondsLeft }: Props) {
   const rawId = useId();
@@ -18,7 +19,7 @@ export function DroneJamOverlay({ active, secondsLeft }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-[300] flex flex-col items-center justify-center bg-zinc-500/75 text-white shadow-[inset_0_0_120px_rgba(0,0,0,0.5)]"
+      className="pointer-events-none absolute inset-0 z-[35] flex flex-col items-center justify-center bg-zinc-500/75 text-white shadow-[inset_0_0_80px_rgba(0,0,0,0.55)]"
       role="alert"
       aria-live="assertive"
       aria-label={`Drohnen-Störung, noch ${secondsLeft} Sekunden`}
@@ -53,7 +54,7 @@ export function DroneJamOverlay({ active, secondsLeft }: Props) {
         <p className="text-xs font-medium uppercase tracking-[0.2em] text-zinc-300">
           Drohnen-Störung
         </p>
-        <p className="mt-4 text-7xl font-black tabular-nums tracking-tight text-white drop-shadow-lg">
+        <p className="mt-3 text-5xl font-black tabular-nums tracking-tight text-white drop-shadow-lg sm:text-6xl">
           {secondsLeft}
         </p>
         <p className="mt-2 text-sm text-zinc-400">Kamera gesperrt</p>
