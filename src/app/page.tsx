@@ -32,7 +32,8 @@ export default function Home() {
         <div className="text-center">
           <h1 className="text-3xl font-bold tracking-tight text-white">Catch (PoC)</h1>
           <p className="mt-2 text-sm text-zinc-400">
-            Zwei Spieler, GPS-Karte, AprilTag per Kamera. Echtzeit über MQTT (HiveMQ, kostenlos).
+            Mehrere Spieler, GPS-Karte, AprilTag (ID 1, 2, 3 …). Jeder jagt jeden – letzter
+            Aktiver gewinnt. Echtzeit über MQTT (HiveMQ, kostenlos).
           </p>
         </div>
 

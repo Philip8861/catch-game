@@ -12,8 +12,10 @@ import {
 } from "react";
 import Webcam from "react-webcam";
 import { useAprilTagDetector } from "@/components/AprilTagDetector";
+import type { StormCircle } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
+import { haversineMeters } from "@/lib/geo";
 import { getOrCreatePlayerId } from "@/lib/playerId";
 
 const GameMapView = dynamic(
@@ -26,9 +28,18 @@ const PRESENCE_MS = 4000;
 const POS_MS = 4000;
 const PRESENCE_TTL_MS = 15000;
 const TAG_FAMILY_NOTE =
-  "PoC nutzt tag36h11 (WASM). Drucke z. B. Tags aus dem AprilRobotics-Repo „apriltag-imgs“ (Ordner tag36h11), IDs 1 und 2.";
+  "PoC: tag36h11 (WASM). Drucke Tags aus „apriltag-imgs“/tag36h11 – Spieler 1 = ID 1, Spieler 2 = ID 2, usw. (bis 16).";
+
+type RosterInfo = {
+  sorted: string[];
+  tagToPlayer: Map<number, string>;
+  playerToTag: Map<string, number>;
+  myTagId: number;
+};
 
 const LOCATION_STORAGE_KEY = "catch-game-use-location";
+const STORM_RADIUS_M = 50;
+const STORM_COOLDOWN_MS = 25_000;
 
 type ViewMode = "map" | "camera";
 
@@ -46,20 +57,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
     Record<string, { lat: number; lng: number; ts: number }>
   >({});
   const [myPos, setMyPos] = useState<{ lat: number; lng: number } | null>(null);
-  const [gameEnded, setGameEnded] = useState<{
-    winnerId: string;
-    loserId: string;
-  } | null>(null);
+  const [caught, setCaught] = useState<Record<string, string>>({});
+  const [winnerId, setWinnerId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [scanDebug, setScanDebug] = useState<string>("AprilTag: starte…");
   const [locationHydrated, setLocationHydrated] = useState(false);
   const [locationConsent, setLocationConsent] = useState<boolean | null>(null);
   const [gpsOk, setGpsOk] = useState<boolean | null>(null);
   const [locationDenied, setLocationDenied] = useState(false);
+  const [stormMode, setStormMode] = useState(false);
+  const [stormCircles, setStormCircles] = useState<StormCircle[]>([]);
+  const [stormCooldownUntil, setStormCooldownUntil] = useState(0);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
-  const lastWinPublish = useRef<number>(0);
+  const lastCatchByVictim = useRef<Record<string, number>>({});
+  const gameEndSentRef = useRef(false);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
 
@@ -87,18 +100,19 @@ export function CatchGame({ roomId }: { roomId: string }) {
       .map(([id]) => id);
   }, [presence, nowTick]);
 
-  const slotInfo = useMemo(() => {
+  const roster = useMemo((): RosterInfo | null => {
     if (activePlayers.length < 2 || !playerId) return null;
     const sorted = [...activePlayers].sort();
-    const mySlot = sorted.indexOf(playerId);
-    if (mySlot < 0) return null;
-    const opponentId = sorted.find((p) => p !== playerId) ?? "";
-    return {
-      slot: (mySlot === 0 ? 1 : 2) as 1 | 2,
-      myTagId: mySlot === 0 ? 1 : 2,
-      targetTagId: mySlot === 0 ? 2 : 1,
-      opponentId,
-    };
+    const tagToPlayer = new Map<number, string>();
+    const playerToTag = new Map<string, number>();
+    sorted.forEach((id, i) => {
+      const tag = i + 1;
+      tagToPlayer.set(tag, id);
+      playerToTag.set(id, tag);
+    });
+    const myTagId = playerToTag.get(playerId);
+    if (myTagId === undefined) return null;
+    return { sorted, tagToPlayer, playerToTag, myTagId };
   }, [activePlayers, playerId]);
 
   const publish = useCallback(
@@ -109,6 +123,70 @@ export function CatchGame({ roomId }: { roomId: string }) {
       });
     },
     [roomKey],
+  );
+
+  const handleStormPlace = useCallback(
+    (lat: number, lng: number) => {
+      setStormMode(false);
+      if (Date.now() < stormCooldownUntil) return;
+      if (!roster) return;
+
+      const center = { lat, lng };
+      const hitPlayerIds: string[] = [];
+      for (const pid of roster.sorted) {
+        if (caught[pid]) continue;
+        let pos: { lat: number; lng: number } | null = null;
+        if (pid === playerId) pos = myPos;
+        else {
+          const p = positions[pid];
+          if (p && nowTick - p.ts < 45000) pos = { lat: p.lat, lng: p.lng };
+        }
+        if (!pos) continue;
+        if (haversineMeters(center, pos) <= STORM_RADIUS_M) hitPlayerIds.push(pid);
+      }
+
+      const ts = Date.now();
+      const stormEventId = `${playerId}-${ts}`;
+      setStormCooldownUntil(ts + STORM_COOLDOWN_MS);
+
+      publish({
+        type: "storm",
+        roomId: roomKey,
+        stormEventId,
+        lat,
+        lng,
+        radiusM: STORM_RADIUS_M,
+        casterPlayerId: playerId,
+        hitPlayerIds,
+        ts,
+      });
+
+      setStormCircles((prev) => {
+        if (prev.some((s) => s.id === stormEventId)) return prev;
+        return [...prev, { id: stormEventId, lat, lng, radiusM: STORM_RADIUS_M }].slice(-12);
+      });
+
+      setCaught((prev) => {
+        let next = prev;
+        for (const vid of hitPlayerIds) {
+          if (next[vid]) continue;
+          if (next === prev) next = { ...prev };
+          next[vid] = playerId;
+        }
+        return next;
+      });
+    },
+    [
+      stormCooldownUntil,
+      roster,
+      caught,
+      playerId,
+      myPos,
+      positions,
+      nowTick,
+      roomKey,
+      publish,
+    ],
   );
 
   useEffect(() => {
@@ -149,8 +227,37 @@ export function CatchGame({ roomId }: { roomId: string }) {
           [msg.playerId]: { lat: msg.lat, lng: msg.lng, ts: msg.ts },
         }));
       }
+      if (msg.type === "player_caught") {
+        setCaught((p) => {
+          if (p[msg.caughtPlayerId]) return p;
+          return { ...p, [msg.caughtPlayerId]: msg.catcherPlayerId };
+        });
+      }
       if (msg.type === "game_end") {
-        setGameEnded({ winnerId: msg.winnerPlayerId, loserId: msg.loserPlayerId });
+        setWinnerId(msg.winnerPlayerId);
+      }
+      if (msg.type === "storm") {
+        setStormCircles((prev) => {
+          if (prev.some((s) => s.id === msg.stormEventId)) return prev;
+          return [
+            ...prev,
+            {
+              id: msg.stormEventId,
+              lat: msg.lat,
+              lng: msg.lng,
+              radiusM: msg.radiusM,
+            },
+          ].slice(-12);
+        });
+        setCaught((prev) => {
+          let next = prev;
+          for (const pid of msg.hitPlayerIds) {
+            if (next[pid]) continue;
+            if (next === prev) next = { ...prev };
+            next[pid] = msg.casterPlayerId;
+          }
+          return next;
+        });
       }
     });
 
@@ -160,7 +267,42 @@ export function CatchGame({ roomId }: { roomId: string }) {
     };
   }, [playerId, roomKey]);
 
-  const canPlay = activePlayers.length >= 2 && !gameEnded;
+  const canPlay = activePlayers.length >= 2 && !winnerId;
+  const iAmCaught = Boolean(playerId && caught[playerId]);
+  const stormOnCooldown = nowTick < stormCooldownUntil;
+
+  const startStormMode = useCallback(() => {
+    if (!canPlay || iAmCaught || winnerId) return;
+    if (Date.now() < stormCooldownUntil) return;
+    setView("map");
+    setStormMode(true);
+  }, [canPlay, iAmCaught, winnerId, stormCooldownUntil]);
+
+  const huntTagIds = useMemo(() => {
+    if (!roster) return [];
+    return roster.sorted
+      .filter((pid) => pid !== playerId && !caught[pid])
+      .map((pid) => roster.playerToTag.get(pid)!)
+      .filter((n) => Number.isFinite(n));
+  }, [roster, playerId, caught]);
+
+  useEffect(() => {
+    if (!roster || winnerId) return;
+    if (roster.sorted.length < 2) return;
+    const survivors = roster.sorted.filter((p) => !caught[p]);
+    if (survivors.length !== 1) return;
+    const w = survivors[0]!;
+    if (!gameEndSentRef.current) {
+      gameEndSentRef.current = true;
+      publish({
+        type: "game_end",
+        roomId: roomKey,
+        winnerPlayerId: w,
+        ts: Date.now(),
+      });
+    }
+    window.queueMicrotask(() => setWinnerId(w));
+  }, [roster, caught, winnerId, publish, roomKey]);
 
   useEffect(() => {
     if (mqttStatus !== "live") return;
@@ -271,35 +413,47 @@ export function CatchGame({ roomId }: { roomId: string }) {
   }, [locationConsent]);
 
   const canPlayRef = useRef(canPlay);
-  const gameEndedRef = useRef(gameEnded);
-  const slotInfoRef = useRef(slotInfo);
+  const winnerIdRef = useRef(winnerId);
+  const rosterRef = useRef(roster);
+  const caughtRef = useRef(caught);
   useLayoutEffect(() => {
     canPlayRef.current = canPlay;
-    gameEndedRef.current = gameEnded;
-    slotInfoRef.current = slotInfo;
-  }, [canPlay, gameEnded, slotInfo]);
+    winnerIdRef.current = winnerId;
+    rosterRef.current = roster;
+    caughtRef.current = caught;
+  }, [canPlay, winnerId, roster, caught]);
 
   const onTagIds = useCallback(
     (ids: number[]) => {
-      if (!canPlayRef.current || gameEndedRef.current || !slotInfoRef.current) return;
-      const target = slotInfoRef.current.targetTagId;
-      if (!ids.includes(target)) return;
+      if (!canPlayRef.current || winnerIdRef.current || caughtRef.current[playerId]) return;
+      const r = rosterRef.current;
+      if (!r) return;
       const now = Date.now();
-      if (now - lastWinPublish.current < 4000) return;
-      lastWinPublish.current = now;
-      publish({
-        type: "game_end",
-        roomId: roomKey,
-        winnerPlayerId: playerId,
-        loserPlayerId: slotInfoRef.current.opponentId,
-        ts: now,
-      });
-      setGameEnded({ winnerId: playerId, loserId: slotInfoRef.current.opponentId });
+      for (const tid of ids) {
+        const victimId = r.tagToPlayer.get(tid);
+        if (!victimId || victimId === playerId) continue;
+        if (caughtRef.current[victimId]) continue;
+        if (tid === r.myTagId) continue;
+        const last = lastCatchByVictim.current[victimId] ?? 0;
+        if (now - last < 2500) continue;
+        lastCatchByVictim.current[victimId] = now;
+        publish({
+          type: "player_caught",
+          roomId: roomKey,
+          caughtPlayerId: victimId,
+          catcherPlayerId: playerId,
+          ts: now,
+        });
+        setCaught((prev) => {
+          if (prev[victimId]) return prev;
+          return { ...prev, [victimId]: playerId };
+        });
+      }
     },
     [playerId, publish, roomKey],
   );
 
-  const aprilEnabled = mqttStatus === "live" && !gameEnded;
+  const aprilEnabled = mqttStatus === "live" && !winnerId && !caught[playerId];
   const onScanDebug = useCallback((s: string) => {
     setScanDebug(s);
   }, []);
@@ -312,8 +466,16 @@ export function CatchGame({ roomId }: { roomId: string }) {
       .map(([pid, v]) => ({ playerId: pid, lat: v.lat, lng: v.lng }));
   }, [positions, nowTick]);
 
-  const iWon = gameEnded?.winnerId === playerId;
-  const iLost = gameEnded?.loserId === playerId;
+  const playerOneId = roster?.sorted[0];
+  const playerOnePos = useMemo(() => {
+    if (!playerOneId) return null;
+    const p = positions[playerOneId];
+    if (p && nowTick - p.ts < 45000) return { lat: p.lat, lng: p.lng };
+    if (playerOneId === playerId && myPos) return { lat: myPos.lat, lng: myPos.lng };
+    return null;
+  }, [playerOneId, positions, nowTick, playerId, myPos]);
+
+  const iWon = winnerId === playerId;
 
   const showLocationModal = locationHydrated && locationConsent === null;
 
@@ -332,7 +494,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
             </h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-300">
               Soll diese Seite deinen <strong className="text-zinc-100">Standort</strong> nutzen? So
-              sehen du und dein Mitspieler euch auf der Karte. Ohne Standort bist du dort nicht
+              sehen du und deine Mitspieler euch auf der Karte. Ohne Standort bist du dort nicht
               sichtbar.
             </p>
             <p className="mt-2 text-xs text-zinc-500">
@@ -416,17 +578,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
         </div>
       </header>
 
-      {gameEnded && (
+      {iAmCaught && !winnerId && (
+        <div className="border-b border-orange-900/60 bg-orange-950/90 px-4 py-3 text-center text-sm text-orange-100">
+          <strong className="text-orange-200">Du wurdest gefangen</strong> – du kannst noch die
+          Karte ansehen, nimmst aber nicht mehr am Jagen teil.
+        </div>
+      )}
+
+      {winnerId && (
         <div className="border-b border-zinc-800 bg-zinc-900 px-4 py-6 text-center">
           <h2 className="text-2xl font-bold text-white">
-            {iWon ? "Du hast gewonnen!" : iLost ? "Du wurdest gefangen!" : "Spiel beendet"}
+            {iWon ? "Du hast gewonnen!" : "Spiel beendet"}
           </h2>
           <p className="mt-2 text-sm text-zinc-400">
             {iWon
-              ? "Du hast den AprilTag des Gegners erkannt."
-              : iLost
-                ? "Dein Gegner hat deinen AprilTag gescannt."
-                : "Ein Spieler hat gewonnen."}
+              ? "Du bist der letzte aktive Spieler."
+              : `Gewonnen hat ein Mitspieler (Session ${winnerId.slice(0, 8)}…).`}
           </p>
         </div>
       )}
@@ -459,14 +626,16 @@ export function CatchGame({ roomId }: { roomId: string }) {
             <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
             <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
           </div>
-          {canPlay && !gameEnded && slotInfo && (
+          {canPlay && !winnerId && roster && (
             <div className="absolute bottom-4 left-4 right-4 rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
               <p>
-                Halte die Kamera auf den <strong>AprilTag ID {slotInfo.targetTagId}</strong>{" "}
-                (Gegner).
+                Dein AprilTag: <strong>ID {roster.myTagId}</strong> – zeige ihn den anderen. Du
+                darfst <strong>jeden anderen</strong> Spieler jagen (AprilTag seiner Nummer scannen).
               </p>
               <p className="mt-1 text-xs text-zinc-300">
-                Dein sichtbarer Tag für den Gegner: <strong>ID {slotInfo.myTagId}</strong>
+                Jagbare Tag-IDs jetzt:{" "}
+                <strong>{huntTagIds.length ? huntTagIds.join(", ") : "—"}</strong>
+                {roster.sorted.length > 2 && ` · ${roster.sorted.length} Spieler im Raum`}
               </p>
             </div>
           )}
@@ -480,8 +649,29 @@ export function CatchGame({ roomId }: { roomId: string }) {
           }
           aria-hidden={view !== "map"}
         >
+          {stormMode && (
+            <div className="rounded-lg border border-violet-700/60 bg-violet-950/90 px-3 py-2 text-sm text-violet-100">
+              <strong>Sturm-Modus:</strong> Tippe auf die Karte, um einen Kreis mit 50&nbsp;m Radius zu
+              setzen. Alle Spieler darin gelten als gefangen.{" "}
+              <button
+                type="button"
+                className="ml-1 underline decoration-violet-400 hover:text-white"
+                onClick={() => setStormMode(false)}
+              >
+                Abbrechen
+              </button>
+            </div>
+          )}
           <div className="min-h-[320px] flex-1 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-inner">
-            <GameMapView myPlayerId={playerId} myPos={myPos} others={othersOnMap} />
+            <GameMapView
+              myPlayerId={playerId}
+              myPos={myPos}
+              others={othersOnMap}
+              playerOnePos={playerOnePos}
+              stormMode={stormMode}
+              onStormPlace={handleStormPlace}
+              stormCircles={stormCircles}
+            />
           </div>
           <p className="text-xs text-zinc-500">
             GPS:{" "}
@@ -497,43 +687,69 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       ? "aktiv – Position wird ~alle 4s gesendet."
                       : "kein Fix – siehe Hinweis oben oder „Erneut versuchen“."}
           </p>
+          <p className="text-xs text-zinc-600">
+            Karte: eigene Ansicht ~<strong className="text-zinc-400">10 km</strong> Radius um dich
+            (wird regelmäßig angepasst). <strong className="text-zinc-400">Spieler 1</strong> hat
+            einen sichtbaren Kreis mit <strong className="text-zinc-400">40 km</strong> Radius.
+          </p>
         </div>
       </div>
 
       <div className="border-t border-zinc-800 bg-zinc-900 px-4 py-3">
-        <div className="flex gap-2">
+        <div className="flex flex-col gap-2">
           <button
             type="button"
-            onClick={() => setView("map")}
-            className={`flex-1 rounded-lg px-4 py-3 text-sm font-medium transition ${
-              view === "map"
-                ? "bg-blue-600 text-white"
-                : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
-            }`}
+            onClick={startStormMode}
+            disabled={!canPlay || iAmCaught || !!winnerId || stormOnCooldown}
+            title={
+              stormOnCooldown
+                ? `Sturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
+                : undefined
+            }
+            className="w-full rounded-lg px-4 py-3 text-sm font-medium transition enabled:bg-violet-700 enabled:text-white enabled:hover:bg-violet-600 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
           >
-            Karte
+            {stormOnCooldown
+              ? `Sturm (${Math.max(0, Math.ceil((stormCooldownUntil - nowTick) / 1000))} s)`
+              : "Sturm"}
           </button>
-          <button
-            type="button"
-            onClick={() => setView("camera")}
-            className={`flex-1 rounded-lg px-4 py-3 text-sm font-medium transition ${
-              view === "camera"
-                ? "bg-blue-600 text-white"
-                : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
-            }`}
-          >
-            Kamera
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setView("map")}
+              className={`flex-1 rounded-lg px-4 py-3 text-sm font-medium transition ${
+                view === "map"
+                  ? "bg-blue-600 text-white"
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              Karte
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setStormMode(false);
+                setView("camera");
+              }}
+              className={`flex-1 rounded-lg px-4 py-3 text-sm font-medium transition ${
+                view === "camera"
+                  ? "bg-blue-600 text-white"
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              Kamera
+            </button>
+          </div>
         </div>
         <div className="mt-3 space-y-1 text-xs text-zinc-500">
           <p>
             Spieler online (TTL): <strong className="text-zinc-300">{activePlayers.length}</strong>
-            {activePlayers.length < 2 && " – warte auf zweiten Spieler im gleichen Raum."}
+            {activePlayers.length < 2 && " – mindestens zwei Spieler für die Jagd."}
           </p>
-          {slotInfo && !gameEnded && (
+          {roster && !winnerId && (
             <p>
-              Rolle: Spieler {slotInfo.slot} · Zeige Tag <strong>{slotInfo.myTagId}</strong> · Suche
-              Tag <strong>{slotInfo.targetTagId}</strong>
+              Dein Tag: <strong>{roster.myTagId}</strong> · Jagen: beliebige andere Tag-IDs (
+              {huntTagIds.length ? huntTagIds.join(", ") : "—"}) · Gefangen:{" "}
+              <strong className="text-zinc-300">{Object.keys(caught).length}</strong>
             </p>
           )}
           <p>{TAG_FAMILY_NOTE}</p>

@@ -31,6 +31,9 @@ function parseDetectionIds(detections: unknown): number[] {
   return [];
 }
 
+/** tag36h11: bekannte Größe für Erkennung (PoC), IDs 1 … MAX */
+const MAX_APRILTAG_IDS = 16;
+
 export function useAprilTagDetector(
   getVideo: () => HTMLVideoElement | null,
   onTagIds: (ids: number[]) => void,
@@ -125,8 +128,9 @@ export function useAprilTagDetector(
             if (cancelled) return;
             void (async () => {
               const video = getVideo();
-              await instance.set_tag_size(1, 0.15);
-              await instance.set_tag_size(2, 0.15);
+              for (let id = 1; id <= MAX_APRILTAG_IDS; id++) {
+                await instance.set_tag_size(id, 0.15);
+              }
               if (video && video.videoWidth > 0) {
                 const fx = video.videoWidth;
                 const fy = video.videoWidth;

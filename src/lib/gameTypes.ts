@@ -14,11 +14,30 @@ export type GameMessage =
       ts: number;
     }
   | {
+      type: "player_caught";
+      roomId: string;
+      caughtPlayerId: string;
+      catcherPlayerId: string;
+      ts: number;
+    }
+  | {
+      type: "storm";
+      roomId: string;
+      stormEventId: string;
+      lat: number;
+      lng: number;
+      radiusM: number;
+      casterPlayerId: string;
+      hitPlayerIds: string[];
+      ts: number;
+    }
+  | {
       type: "game_end";
       roomId: string;
       winnerPlayerId: string;
-      loserPlayerId: string;
       ts: number;
+      /** @deprecated nur noch für alte Clients / Logs */
+      loserPlayerId?: string;
     };
 
 export function parseGameMessage(raw: string): GameMessage | null {
