@@ -28,6 +28,8 @@ const PRESENCE_TTL_MS = 15000;
 const TAG_FAMILY_NOTE =
   "PoC nutzt tag36h11 (WASM). Drucke z. B. Tags aus dem AprilRobotics-Repo „apriltag-imgs“ (Ordner tag36h11), IDs 1 und 2.";
 
+const LOCATION_STORAGE_KEY = "catch-game-use-location";
+
 type ViewMode = "map" | "camera";
 
 function topicForRoom(roomKey: string) {
@@ -50,13 +52,29 @@ export function CatchGame({ roomId }: { roomId: string }) {
   } | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [scanDebug, setScanDebug] = useState<string>("AprilTag: starte…");
+  const [locationHydrated, setLocationHydrated] = useState(false);
+  const [locationConsent, setLocationConsent] = useState<boolean | null>(null);
   const [gpsOk, setGpsOk] = useState<boolean | null>(null);
+  const [locationDenied, setLocationDenied] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
   const lastWinPublish = useRef<number>(0);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      const v = sessionStorage.getItem(LOCATION_STORAGE_KEY);
+      if (v === "yes") setLocationConsent(true);
+      else if (v === "no") {
+        setLocationConsent(false);
+        setGpsOk(false);
+      } else setLocationConsent(null);
+      setLocationHydrated(true);
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     const id = window.setInterval(() => setNowTick(Date.now()), 1000);
@@ -173,7 +191,60 @@ export function CatchGame({ roomId }: { roomId: string }) {
     return () => clearInterval(id);
   }, [mqttStatus, myPos, playerId, publish, roomKey]);
 
+  const requestLocationNow = useCallback(() => {
+    if (!navigator.geolocation) {
+      window.setTimeout(() => setGpsOk(false), 0);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLocationDenied(false);
+        setGpsOk(true);
+        setMyPos({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      (err) => {
+        setGpsOk(false);
+        if (err.code === 1) setLocationDenied(true);
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 },
+    );
+  }, []);
+
+  const handleEnableLocation = useCallback(() => {
+    try {
+      sessionStorage.setItem(LOCATION_STORAGE_KEY, "yes");
+    } catch {
+      /* private mode */
+    }
+    setLocationConsent(true);
+    setLocationDenied(false);
+    requestLocationNow();
+  }, [requestLocationNow]);
+
+  const handleDeclineLocation = useCallback(() => {
+    try {
+      sessionStorage.setItem(LOCATION_STORAGE_KEY, "no");
+    } catch {
+      /* private mode */
+    }
+    setLocationConsent(false);
+    setLocationDenied(false);
+    setGpsOk(false);
+    setMyPos(null);
+  }, []);
+
+  const handleReopenLocationChoice = useCallback(() => {
+    try {
+      sessionStorage.removeItem(LOCATION_STORAGE_KEY);
+    } catch {
+      /* */
+    }
+    setLocationConsent(null);
+    setLocationDenied(false);
+  }, []);
+
   useEffect(() => {
+    if (!locationConsent) return;
     if (!navigator.geolocation) {
       const t = window.setTimeout(() => setGpsOk(false), 0);
       return () => clearTimeout(t);
@@ -182,8 +253,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setGpsOk(true);
       setMyPos({ lat: pos.coords.latitude, lng: pos.coords.longitude });
     };
-    const onErr = () => {
+    const onErr = (err: GeolocationPositionError) => {
       setGpsOk(false);
+      if (err.code === 1) setLocationDenied(true);
       navigator.geolocation.getCurrentPosition(onOk, () => setGpsOk(false), {
         enableHighAccuracy: false,
         maximumAge: 60000,
@@ -196,7 +268,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
       timeout: 20000,
     });
     return () => navigator.geolocation.clearWatch(watch);
-  }, []);
+  }, [locationConsent]);
 
   const canPlayRef = useRef(canPlay);
   const gameEndedRef = useRef(gameEnded);
@@ -243,8 +315,82 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const iWon = gameEnded?.winnerId === playerId;
   const iLost = gameEnded?.loserId === playerId;
 
+  const showLocationModal = locationHydrated && locationConsent === null;
+
   return (
     <div className="flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
+      {showLocationModal && (
+        <div
+          className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="location-dialog-title"
+        >
+          <div className="max-w-md rounded-2xl border border-zinc-700 bg-zinc-900 p-6 shadow-2xl">
+            <h2 id="location-dialog-title" className="text-lg font-semibold text-white">
+              Standort für die Karte
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-zinc-300">
+              Soll diese Seite deinen <strong className="text-zinc-100">Standort</strong> nutzen? So
+              sehen du und dein Mitspieler euch auf der Karte. Ohne Standort bist du dort nicht
+              sichtbar.
+            </p>
+            <p className="mt-2 text-xs text-zinc-500">
+              <strong className="text-zinc-400">iPhone:</strong> Wenn nichts passiert oder es
+              fehlschlägt: Einstellungen → Datenschutz und Sicherheit →{" "}
+              <span className="text-zinc-400">Ortungsdienste</span> →{" "}
+              <span className="text-zinc-400">Safari-Websites</span> → „Beim Verwenden“ oder
+              „Genau“. Seite danach neu laden und erneut „Aktivieren“ tippen.
+            </p>
+            <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+              <button
+                type="button"
+                onClick={handleEnableLocation}
+                className="flex-1 rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-500"
+              >
+                Standort aktivieren
+              </button>
+              <button
+                type="button"
+                onClick={handleDeclineLocation}
+                className="flex-1 rounded-xl border border-zinc-600 bg-zinc-800 px-4 py-3 text-sm font-medium text-zinc-200 transition hover:bg-zinc-700"
+              >
+                Ohne Standort fortfahren
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {locationConsent === false && (
+        <div className="border-b border-amber-800/60 bg-amber-950/90 px-4 py-2.5 text-center text-sm text-amber-100">
+          <span className="text-amber-200/90">Standort ist aus</span> – Mitspieler sehen dich nicht
+          auf der Karte.{" "}
+          <button
+            type="button"
+            onClick={handleReopenLocationChoice}
+            className="font-semibold text-amber-300 underline decoration-amber-500/60 underline-offset-2 hover:text-amber-200"
+          >
+            Standort-Frage erneut anzeigen
+          </button>
+        </div>
+      )}
+
+      {locationConsent === true && locationDenied && (
+        <div className="border-b border-red-900/50 bg-red-950/80 px-4 py-2.5 text-center text-xs leading-snug text-red-100">
+          <strong className="text-red-200">Standortzugriff verweigert.</strong> Erlaube Ortung für
+          diese Website (Safari: Adressleiste → „aa“ → Website-Einstellungen → Standort). Oder
+          iPhone: Einstellungen → Datenschutz → Ortungsdienste → Safari-Websites.{" "}
+          <button
+            type="button"
+            onClick={requestLocationNow}
+            className="ml-1 font-semibold text-red-200 underline underline-offset-2 hover:text-white"
+          >
+            Erneut versuchen
+          </button>
+        </div>
+      )}
+
       <header className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-4 py-3">
         <div>
           <p className="text-xs uppercase tracking-wide text-zinc-500">Raum</p>
@@ -339,11 +485,17 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
           <p className="text-xs text-zinc-500">
             GPS:{" "}
-            {gpsOk === null
+            {!locationHydrated
               ? "…"
-              : gpsOk
-                ? "aktiv – Position wird ~alle 4s gesendet (auch mit nur 1 Spieler)."
-                : "kein Fix – Gegner sieht dich nicht. Standort erlauben oder Mobilgerät nutzen."}
+              : locationConsent === null
+                ? "Bitte Entscheidung im Dialog treffen."
+                : locationConsent === false
+                  ? "aus – du wirst auf der Karte nicht geteilt."
+                  : gpsOk === null
+                    ? "Suche Standort…"
+                    : gpsOk
+                      ? "aktiv – Position wird ~alle 4s gesendet."
+                      : "kein Fix – siehe Hinweis oben oder „Erneut versuchen“."}
           </p>
         </div>
       </div>
