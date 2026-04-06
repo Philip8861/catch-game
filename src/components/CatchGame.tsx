@@ -13,6 +13,7 @@ import {
 import Webcam from "react-webcam";
 import { useAprilTagDetector } from "@/components/AprilTagDetector";
 import { DroneJamOverlay } from "@/components/DroneJamOverlay";
+import { HpDamageFloaters } from "@/components/HpDamageFloaters";
 import type { StormCircle } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
@@ -82,6 +83,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [jamEndsAt, setJamEndsAt] = useState(0);
   const [hpDisplay, setHpDisplay] = useState(MAX_HP);
   const [tagBeamActive, setTagBeamActive] = useState(false);
+  const [hpFloaters, setHpFloaters] = useState<
+    Array<{ id: string; text: string }>
+  >([]);
+  const [aimHuntTagId, setAimHuntTagId] = useState<number | null>(null);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -96,8 +101,21 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const lastTagLockScannerRef = useRef<string | null>(null);
   const zeroHpHandledRef = useRef(false);
   const lastTagLockPublishRef = useRef<Record<string, number>>({});
+  const tagDrainVisualDebtRef = useRef(0);
+  const spawnDamageFloaterRef = useRef<(text: string) => void>(() => {});
+  const prevAimHuntTagRef = useRef<number | null>(null);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
+
+  useLayoutEffect(() => {
+    spawnDamageFloaterRef.current = (text: string) => {
+      const id = `f-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      setHpFloaters((prev) => [...prev.slice(-24), { id, text }]);
+      window.setTimeout(() => {
+        setHpFloaters((prev) => prev.filter((x) => x.id !== id));
+      }, 900);
+    };
+  }, []);
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -277,6 +295,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
             window.queueMicrotask(() => {
               setHpDisplay(Math.round(nextHp));
             });
+            const pops = STORM_HP_DAMAGE / 50;
+            for (let i = 0; i < pops; i++) {
+              window.setTimeout(() => {
+                spawnDamageFloaterRef.current("-50 HP");
+              }, i * 55);
+            }
             if (nextHp <= 0 && !zeroHpHandledRef.current) {
               zeroHpHandledRef.current = true;
               const ts = Date.now();
@@ -372,6 +396,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagLockPublishRef.current = {};
     window.queueMicrotask(() => {
       setHpDisplay(MAX_HP);
+      setHpFloaters([]);
+      setAimHuntTagId(null);
+      prevAimHuntTagRef.current = null;
     });
   }, [roster]);
 
@@ -528,6 +555,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
       if (wasHpBeamLockedRef.current !== locked) {
         lastHpDamageAtRef.current = now;
         wasHpBeamLockedRef.current = locked;
+        tagDrainVisualDebtRef.current = 0;
       }
       if (prevTagBeamUiRef.current !== locked) {
         prevTagBeamUiRef.current = locked;
@@ -538,7 +566,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
         const dt = Math.min(0.2, (now - lastHpDamageAtRef.current) / 1000);
         lastHpDamageAtRef.current = now;
         if (dt > 0) {
-          hpRef.current = Math.max(0, hpRef.current - HP_DRAIN_PER_SEC * dt);
+          const dealt = HP_DRAIN_PER_SEC * dt;
+          hpRef.current = Math.max(0, hpRef.current - dealt);
+          tagDrainVisualDebtRef.current += dealt;
+          while (tagDrainVisualDebtRef.current >= 50) {
+            tagDrainVisualDebtRef.current -= 50;
+            spawnDamageFloaterRef.current("-50 HP");
+          }
           const rounded = Math.round(hpRef.current);
           setHpDisplay((prev) => (prev !== rounded ? rounded : prev));
           if (hpRef.current <= 0 && !zeroHpHandledRef.current) {
@@ -562,6 +596,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
         }
       } else {
         lastHpDamageAtRef.current = now;
+        tagDrainVisualDebtRef.current = 0;
       }
 
       frame = requestAnimationFrame(step);
@@ -604,6 +639,20 @@ export function CatchGame({ roomId }: { roomId: string }) {
           delete lastTagLockPublishRef.current[pid];
         }
       }
+
+      let aim: number | null = null;
+      for (const tid of ids) {
+        const victimId = r.tagToPlayer.get(tid);
+        if (!victimId || victimId === playerId) continue;
+        if (caughtRef.current[victimId]) continue;
+        if (tid === r.myTagId) continue;
+        aim = tid;
+        break;
+      }
+      if (aim !== prevAimHuntTagRef.current) {
+        prevAimHuntTagRef.current = aim;
+        window.queueMicrotask(() => setAimHuntTagId(aim));
+      }
     },
     [playerId, publish, roomKey],
   );
@@ -636,6 +685,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
   return (
     <div className="relative flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
+      <HpDamageFloaters items={hpFloaters} />
       {showLocationModal && (
         <div
           className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
@@ -823,6 +873,19 @@ export function CatchGame({ roomId }: { roomId: string }) {
               <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
             </div>
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
+            {aimHuntTagId !== null && canPlay && !winnerId && roster && (
+              <div className="pointer-events-none absolute left-1/2 top-1/2 z-[32] -translate-x-1/2 -translate-y-[120%]">
+                <div className="rounded-full border-2 border-emerald-400/90 bg-emerald-950/95 px-4 py-2 text-center shadow-lg shadow-emerald-900/40">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-300/90">
+                    Code erkannt
+                  </p>
+                  <p className="mt-0.5 text-lg font-bold tabular-nums text-emerald-50">
+                    AprilTag {aimHuntTagId}
+                  </p>
+                  <p className="text-[10px] text-emerald-200/80">Im Fadenkreuz · HP-Drain aktiv</p>
+                </div>
+              </div>
+            )}
             {canPlay && !winnerId && roster && (
               <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[20] rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
                 <p>
