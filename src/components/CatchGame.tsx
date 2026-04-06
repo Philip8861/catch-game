@@ -41,6 +41,7 @@ type RosterInfo = {
 const LOCATION_STORAGE_KEY = "catch-game-use-location";
 const STORM_RADIUS_M = 5000;
 const STORM_COOLDOWN_MS = 25_000;
+const STORM_HP_DAMAGE = 500;
 const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
@@ -84,9 +85,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
-  const lastCatchByVictim = useRef<Record<string, number>>({});
   const gameEndSentRef = useRef(false);
   const processedDroneJamIdsRef = useRef<string[]>([]);
+  const processedStormDamageIdsRef = useRef<string[]>([]);
   const hpRef = useRef(MAX_HP);
   const tagLockUntilRef = useRef(0);
   const lastHpDamageAtRef = useRef(0);
@@ -187,16 +188,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (prev.some((s) => s.id === stormEventId)) return prev;
         return [...prev, { id: stormEventId, lat, lng, radiusM: STORM_RADIUS_M }].slice(-12);
       });
-
-      setCaught((prev) => {
-        let next = prev;
-        for (const vid of hitPlayerIds) {
-          if (next[vid]) continue;
-          if (next === prev) next = { ...prev };
-          next[vid] = playerId;
-        }
-        return next;
-      });
     },
     [
       stormCooldownUntil,
@@ -276,15 +267,30 @@ export function CatchGame({ roomId }: { roomId: string }) {
             },
           ].slice(-12);
         });
-        setCaught((prev) => {
-          let next = prev;
-          for (const pid of msg.hitPlayerIds) {
-            if (next[pid]) continue;
-            if (next === prev) next = { ...prev };
-            next[pid] = msg.casterPlayerId;
+        const dmgSeen = processedStormDamageIdsRef.current;
+        if (!dmgSeen.includes(msg.stormEventId)) {
+          dmgSeen.push(msg.stormEventId);
+          if (dmgSeen.length > 80) dmgSeen.splice(0, 40);
+          if (msg.hitPlayerIds.includes(playerId) && !zeroHpHandledRef.current) {
+            const nextHp = Math.max(0, hpRef.current - STORM_HP_DAMAGE);
+            hpRef.current = nextHp;
+            window.queueMicrotask(() => {
+              setHpDisplay(Math.round(nextHp));
+            });
+            if (nextHp <= 0 && !zeroHpHandledRef.current) {
+              zeroHpHandledRef.current = true;
+              const ts = Date.now();
+              publish({
+                type: "player_caught",
+                roomId: roomKey,
+                caughtPlayerId: playerId,
+                catcherPlayerId: msg.casterPlayerId,
+                ts,
+              });
+              setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: msg.casterPlayerId }));
+            }
           }
-          return next;
-        });
+        }
       }
       if (msg.type === "drone_jam") {
         if (msg.casterPlayerId === playerId) return;
@@ -306,7 +312,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
       client.end(true);
       clientRef.current = null;
     };
-  }, [playerId, roomKey]);
+  }, [playerId, roomKey, publish]);
 
   const canPlay = activePlayers.length >= 2 && !winnerId;
   const iAmCaught = Boolean(playerId && caught[playerId]);
@@ -589,20 +595,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
             ts: now,
           });
         }
-        const last = lastCatchByVictim.current[victimId] ?? 0;
-        if (now - last < 2500) continue;
-        lastCatchByVictim.current[victimId] = now;
-        publish({
-          type: "player_caught",
-          roomId: roomKey,
-          caughtPlayerId: victimId,
-          catcherPlayerId: playerId,
-          ts: now,
-        });
-        setCaught((prev) => {
-          if (prev[victimId]) return prev;
-          return { ...prev, [victimId]: playerId };
-        });
       }
       for (const pid of r.sorted) {
         if (pid === playerId) continue;
@@ -858,8 +850,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
         >
           {stormMode && (
             <div className="rounded-lg border border-violet-700/60 bg-violet-950/90 px-3 py-2 text-sm text-violet-100">
-              <strong>Sturm-Modus:</strong> Tippe auf die Karte, um einen Kreis mit 5&nbsp;km Radius zu
-              setzen. Alle Spieler darin gelten als gefangen.{" "}
+              <strong>Sturm-Modus:</strong> Tippe auf die Karte für einen Kreis mit 5&nbsp;km Radius.
+              Getroffene Spieler verlieren <strong className="text-violet-200">{STORM_HP_DAMAGE} HP</strong>
+              ; bei 0 HP sind sie gefangen.{" "}
               <button
                 type="button"
                 className="ml-1 underline decoration-violet-400 hover:text-white"
