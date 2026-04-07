@@ -64,6 +64,8 @@ export type GameMessage =
       damage: number;
       weapon: "sniper" | "semi";
       ts: number;
+      /** Crit = finaler Schaden bereits ×2 auf Basiswaffe */
+      isCrit?: boolean;
     }
   | {
       type: "tag_heal";

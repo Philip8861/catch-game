@@ -53,6 +53,11 @@ const SNIPER_DMG_MAX = 90;
 const SEMI_COOLDOWN_MS = 500;
 const SEMI_DMG_MIN = 15;
 const SEMI_DMG_MAX = 35;
+/** Crit verdoppelt den pro Schuss gewürfelten Waffenschaden. */
+const WEAPON_CRIT_MULT = 2;
+const DEFAULT_CRIT_CHANCE = 0.1;
+const DMG_CRIT_PCT_MIN = 10;
+const DMG_CRIT_PCT_MAX = 100;
 const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
@@ -64,6 +69,10 @@ function combatRoleStorageKey(roomKey: string) {
 
 function weaponStorageKey(roomKey: string) {
   return `catch-game-weapon:${roomKey}`;
+}
+
+function dmgCritPctStorageKey(roomKey: string) {
+  return `catch-game-dmg-crit-pct:${roomKey}`;
 }
 
 type ViewMode = "map" | "camera";
@@ -108,6 +117,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [combatRole, setCombatRole] = useState<CombatRole | null>(null);
   const [tagHealActive, setTagHealActive] = useState(false);
   const [weaponChoice, setWeaponChoice] = useState<WeaponType>("sniper");
+  const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
   const [firePressed, setFirePressed] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
@@ -134,6 +144,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const weaponTypeRef = useRef<WeaponType>("sniper");
   const lastSniperShotAtRef = useRef(0);
   const lastSemiShotAtRef = useRef(0);
+  const dmgCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
   const spawnCombatFloaterRef = useRef<
     (text: string, variant?: "damage" | "heal" | "crit") => void
   >(() => {});
@@ -163,6 +174,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
     weaponTypeRef.current = weaponChoice;
   }, [weaponChoice]);
 
+  useLayoutEffect(() => {
+    dmgCritChanceRef.current = dmgCritPercent / 100;
+  }, [dmgCritPercent]);
+
   useEffect(() => {
     const release = () => {
       fireHeldRef.current = false;
@@ -181,6 +196,21 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setWeaponChoice(w);
       try {
         sessionStorage.setItem(weaponStorageKey(roomKey), w);
+      } catch {
+        /* */
+      }
+    },
+    [roomKey],
+  );
+
+  const onDmgCritPercentChange = useCallback(
+    (v: number) => {
+      const c = Math.round(
+        Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, v)),
+      );
+      setDmgCritPercent(c);
+      try {
+        sessionStorage.setItem(dmgCritPctStorageKey(roomKey), String(c));
       } catch {
         /* */
       }
@@ -207,6 +237,25 @@ export function CatchGame({ roomId }: { roomId: string }) {
       try {
         const w = sessionStorage.getItem(weaponStorageKey(roomKey));
         if (w === "sniper" || w === "semi") setWeaponChoice(w);
+      } catch {
+        /* */
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, [roomKey]);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        const raw = sessionStorage.getItem(dmgCritPctStorageKey(roomKey));
+        const n = raw !== null ? Number(raw) : NaN;
+        if (Number.isFinite(n)) {
+          setDmgCritPercent(
+            Math.round(
+              Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, n)),
+            ),
+          );
+        }
       } catch {
         /* */
       }
@@ -447,10 +496,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
         });
         const w = msg.weapon;
         const label = w === "sniper" ? "Sniper" : w === "semi" ? "Halbauto" : "";
-        spawnCombatFloaterRef.current(
-          label ? `-${dmg} (${label})` : `-${dmg} HP`,
-          "damage",
-        );
+        const isCrit = msg.isCrit === true;
+        if (isCrit) {
+          spawnCombatFloaterRef.current(
+            label ? `-${dmg} CRIT! (${label})` : `-${dmg} CRIT!`,
+            "crit",
+          );
+        } else {
+          spawnCombatFloaterRef.current(
+            label ? `-${dmg} (${label})` : `-${dmg} HP`,
+            "damage",
+          );
+        }
         if (nextHp <= 0 && !zeroHpHandledRef.current) {
           zeroHpHandledRef.current = true;
           const catcher = lastTagLockScannerRef.current;
@@ -752,11 +809,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
           if (weapon === "sniper") {
             if (now - lastSniperShotAtRef.current >= SNIPER_COOLDOWN_MS) {
               lastSniperShotAtRef.current = now;
-              const dmg =
+              const base =
                 SNIPER_DMG_MIN +
                 Math.floor(
                   Math.random() * (SNIPER_DMG_MAX - SNIPER_DMG_MIN + 1),
                 );
+              const crit = Math.random() < dmgCritChanceRef.current;
+              const dmg = crit
+                ? Math.round(base * WEAPON_CRIT_MULT)
+                : base;
               const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
               publish({
                 type: "weapon_hit",
@@ -766,14 +827,19 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 victimPlayerId: victim,
                 damage: dmg,
                 weapon: "sniper",
+                isCrit: crit,
                 ts: now,
               });
             }
           } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
             lastSemiShotAtRef.current = now;
-            const dmg =
+            const base =
               SEMI_DMG_MIN +
               Math.floor(Math.random() * (SEMI_DMG_MAX - SEMI_DMG_MIN + 1));
+            const crit = Math.random() < dmgCritChanceRef.current;
+            const dmg = crit
+              ? Math.round(base * WEAPON_CRIT_MULT)
+              : base;
             const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
             publish({
               type: "weapon_hit",
@@ -783,6 +849,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               victimPlayerId: victim,
               damage: dmg,
               weapon: "semi",
+              isCrit: crit,
               ts: now,
             });
           }
@@ -988,7 +1055,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
               <strong className="text-rose-300">Sniper</strong>{" "}
               {SNIPER_DMG_MIN}–{SNIPER_DMG_MAX} HP alle {SNIPER_COOLDOWN_MS / 1000}s,{" "}
               <strong className="text-rose-300">Halbautomatik</strong>{" "}
-              {SEMI_DMG_MIN}–{SEMI_DMG_MAX} HP alle {SEMI_COOLDOWN_MS} ms.{" "}
+              {SEMI_DMG_MIN}–{SEMI_DMG_MAX} HP alle {SEMI_COOLDOWN_MS} ms. Crit mit einstellbarer
+              Chance (Standard {DMG_CRIT_PCT_MIN}%, bis {DMG_CRIT_PCT_MAX}%) verdoppelt den
+              jeweiligen Treffer.{" "}
               <strong className="text-zinc-100">Heilung</strong> stellt{" "}
               <strong className="text-emerald-300">{HEAL_PER_SEC} HP/s</strong> wieder her. Beides
               kann ein Ziel <strong className="text-zinc-100">gleichzeitig</strong> treffen.
@@ -1117,6 +1186,32 @@ export function CatchGame({ roomId }: { roomId: string }) {
               Schaden: Ziel im Visier – unten <strong className="text-rose-100">Feuer halten</strong> zum
               Schießen
             </p>
+          )}
+          {combatRole === "dmg" && (
+            <div className="mt-2 rounded-lg border border-rose-900/50 bg-rose-950/50 px-3 py-2">
+              <label className="flex flex-col gap-1.5 text-left text-[11px] text-rose-100/95">
+                <span className="flex items-center justify-between gap-2 font-medium">
+                  <span>Crit-Chance (×{WEAPON_CRIT_MULT} auf Waffenschaden)</span>
+                  <span className="tabular-nums text-rose-200">{dmgCritPercent}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={DMG_CRIT_PCT_MIN}
+                  max={DMG_CRIT_PCT_MAX}
+                  step={1}
+                  value={dmgCritPercent}
+                  onChange={(e) => onDmgCritPercentChange(Number(e.target.value))}
+                  className="h-2 w-full cursor-pointer accent-rose-400"
+                  aria-valuemin={DMG_CRIT_PCT_MIN}
+                  aria-valuemax={DMG_CRIT_PCT_MAX}
+                  aria-valuenow={dmgCritPercent}
+                  aria-label="Crit-Chance für Waffenschaden"
+                />
+                <span className="text-[10px] leading-snug text-rose-200/75">
+                  Pro Schuss gewürfelt; Crit-Treffer nutzen die große goldene Anzeige.
+                </span>
+              </label>
+            </div>
           )}
           {tagHealActive && (
             <p className="mt-1 text-center text-[11px] font-medium text-emerald-200/90">
