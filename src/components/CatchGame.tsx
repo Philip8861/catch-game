@@ -48,10 +48,17 @@ const DRONE_JAM_COOLDOWN_MS = 35_000;
 
 const MAX_HP = 1000;
 const HP_DRAIN_PER_SEC = 50;
+const HEAL_PER_SEC = 25;
+const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
 const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
 
+function combatRoleStorageKey(roomKey: string) {
+  return `catch-game-combat-role:${roomKey}`;
+}
+
 type ViewMode = "map" | "camera";
+type CombatRole = "dmg" | "heal";
 
 function topicForRoom(roomKey: string) {
   return `catch-game/demo/${roomKey}`;
@@ -84,9 +91,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [hpDisplay, setHpDisplay] = useState(MAX_HP);
   const [tagBeamActive, setTagBeamActive] = useState(false);
   const [hpFloaters, setHpFloaters] = useState<
-    Array<{ id: string; text: string }>
+    Array<{ id: string; text: string; variant?: "damage" | "heal" }>
   >([]);
   const [aimHuntTagId, setAimHuntTagId] = useState<number | null>(null);
+  const [combatRoleHydrated, setCombatRoleHydrated] = useState(false);
+  const [combatRole, setCombatRole] = useState<CombatRole | null>(null);
+  const [tagHealActive, setTagHealActive] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -94,28 +104,57 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const processedDroneJamIdsRef = useRef<string[]>([]);
   const processedStormDamageIdsRef = useRef<string[]>([]);
   const hpRef = useRef(MAX_HP);
-  const tagLockUntilRef = useRef(0);
-  const lastHpDamageAtRef = useRef(0);
-  const wasHpBeamLockedRef = useRef(false);
+  const tagDamageLockUntilRef = useRef(0);
+  const tagHealLockUntilRef = useRef(0);
+  const lastCombatFrameRef = useRef(0);
+  const prevDamageLockedRef = useRef(false);
+  const prevHealLockedRef = useRef(false);
   const prevTagBeamUiRef = useRef(false);
+  const prevHealBeamUiRef = useRef(false);
   const lastTagLockScannerRef = useRef<string | null>(null);
   const zeroHpHandledRef = useRef(false);
   const lastTagLockPublishRef = useRef<Record<string, number>>({});
+  const lastTagHealPublishRef = useRef<Record<string, number>>({});
   const tagDrainVisualDebtRef = useRef(0);
-  const spawnDamageFloaterRef = useRef<(text: string) => void>(() => {});
+  const tagHealVisualDebtRef = useRef(0);
+  const spawnCombatFloaterRef = useRef<
+    (text: string, variant?: "damage" | "heal") => void
+  >(() => {});
   const prevAimHuntTagRef = useRef<number | null>(null);
+  const combatRoleRef = useRef<CombatRole | null>(null);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
 
   useLayoutEffect(() => {
-    spawnDamageFloaterRef.current = (text: string) => {
+    spawnCombatFloaterRef.current = (
+      text: string,
+      variant: "damage" | "heal" = "damage",
+    ) => {
       const id = `f-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      setHpFloaters((prev) => [...prev.slice(-24), { id, text }]);
+      setHpFloaters((prev) => [...prev.slice(-24), { id, text, variant }]);
       window.setTimeout(() => {
         setHpFloaters((prev) => prev.filter((x) => x.id !== id));
       }, 900);
     };
   }, []);
+
+  useLayoutEffect(() => {
+    combatRoleRef.current = combatRole;
+  }, [combatRole]);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        const r = sessionStorage.getItem(combatRoleStorageKey(roomKey));
+        if (r === "heal" || r === "dmg") setCombatRole(r);
+        else setCombatRole(null);
+      } catch {
+        setCombatRole(null);
+      }
+      setCombatRoleHydrated(true);
+    }, 0);
+    return () => clearTimeout(t);
+  }, [roomKey]);
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -170,6 +209,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
     (lat: number, lng: number) => {
       setStormMode(false);
       if (Date.now() < stormCooldownUntil) return;
+      if (!combatRole) return;
       if (!roster) return;
 
       const center = { lat, lng };
@@ -209,6 +249,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
     },
     [
       stormCooldownUntil,
+      combatRole,
       roster,
       caught,
       playerId,
@@ -298,7 +339,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
             const pops = STORM_HP_DAMAGE / 50;
             for (let i = 0; i < pops; i++) {
               window.setTimeout(() => {
-                spawnDamageFloaterRef.current("-50 HP");
+                spawnCombatFloaterRef.current("-50 HP", "damage");
               }, i * 55);
             }
             if (nextHp <= 0 && !zeroHpHandledRef.current) {
@@ -327,8 +368,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
       if (msg.type === "tag_lock") {
         if (msg.victimPlayerId !== playerId) return;
         const t = Date.now();
-        tagLockUntilRef.current = t + TAG_LOCK_TTL_MS;
+        tagDamageLockUntilRef.current = t + TAG_LOCK_TTL_MS;
         lastTagLockScannerRef.current = msg.scannerPlayerId;
+      }
+      if (msg.type === "tag_heal") {
+        if (msg.victimPlayerId !== playerId) return;
+        const t = Date.now();
+        tagHealLockUntilRef.current = t + TAG_LOCK_TTL_MS;
       }
     });
 
@@ -339,18 +385,19 @@ export function CatchGame({ roomId }: { roomId: string }) {
   }, [playerId, roomKey, publish]);
 
   const canPlay = activePlayers.length >= 2 && !winnerId;
+  const canPlayWithRole = canPlay && combatRole !== null;
   const iAmCaught = Boolean(playerId && caught[playerId]);
   const stormOnCooldown = nowTick < stormCooldownUntil;
 
   const startStormMode = useCallback(() => {
-    if (!canPlay || iAmCaught || winnerId) return;
+    if (!canPlayWithRole || iAmCaught || winnerId) return;
     if (Date.now() < stormCooldownUntil) return;
     setView("map");
     setStormMode(true);
-  }, [canPlay, iAmCaught, winnerId, stormCooldownUntil]);
+  }, [canPlayWithRole, iAmCaught, winnerId, stormCooldownUntil]);
 
   const sendDroneJam = useCallback(() => {
-    if (!canPlay || iAmCaught || winnerId) return;
+    if (!canPlayWithRole || iAmCaught || winnerId) return;
     if (nowTick < droneJamCooldownUntil) return;
     const ts = Date.now();
     const jamEventId = `${playerId}-${ts}`;
@@ -365,7 +412,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
       ts,
     });
   }, [
-    canPlay,
+    canPlayWithRole,
     iAmCaught,
     winnerId,
     nowTick,
@@ -391,9 +438,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
     if (roster) return;
     hpRef.current = MAX_HP;
     zeroHpHandledRef.current = false;
-    tagLockUntilRef.current = 0;
+    tagDamageLockUntilRef.current = 0;
+    tagHealLockUntilRef.current = 0;
     lastTagLockScannerRef.current = null;
     lastTagLockPublishRef.current = {};
+    lastTagHealPublishRef.current = {};
+    tagHealVisualDebtRef.current = 0;
     window.queueMicrotask(() => {
       setHpDisplay(MAX_HP);
       setHpFloaters([]);
@@ -540,63 +590,91 @@ export function CatchGame({ roomId }: { roomId: string }) {
   }, [canPlay, winnerId, roster, caught]);
 
   useEffect(() => {
-    lastHpDamageAtRef.current = Date.now();
+    lastCombatFrameRef.current = Date.now();
     let frame = 0;
     let alive = true;
     const step = () => {
       if (!alive) return;
       const now = Date.now();
-      const locked =
-        now < tagLockUntilRef.current &&
+      const dt = Math.min(0.2, (now - lastCombatFrameRef.current) / 1000);
+      lastCombatFrameRef.current = now;
+
+      const damageLocked =
+        now < tagDamageLockUntilRef.current &&
         canPlayRef.current &&
         !caughtRef.current[playerId] &&
         !winnerIdRef.current;
 
-      if (wasHpBeamLockedRef.current !== locked) {
-        lastHpDamageAtRef.current = now;
-        wasHpBeamLockedRef.current = locked;
+      const healLocked =
+        now < tagHealLockUntilRef.current &&
+        canPlayRef.current &&
+        !caughtRef.current[playerId] &&
+        !winnerIdRef.current &&
+        hpRef.current < MAX_HP;
+
+      if (prevDamageLockedRef.current !== damageLocked) {
+        prevDamageLockedRef.current = damageLocked;
         tagDrainVisualDebtRef.current = 0;
       }
-      if (prevTagBeamUiRef.current !== locked) {
-        prevTagBeamUiRef.current = locked;
-        setTagBeamActive(locked);
+      if (prevHealLockedRef.current !== healLocked) {
+        prevHealLockedRef.current = healLocked;
+        tagHealVisualDebtRef.current = 0;
       }
 
-      if (locked && hpRef.current > 0) {
-        const dt = Math.min(0.2, (now - lastHpDamageAtRef.current) / 1000);
-        lastHpDamageAtRef.current = now;
-        if (dt > 0) {
+      if (prevTagBeamUiRef.current !== damageLocked) {
+        prevTagBeamUiRef.current = damageLocked;
+        setTagBeamActive(damageLocked);
+      }
+      if (prevHealBeamUiRef.current !== healLocked) {
+        prevHealBeamUiRef.current = healLocked;
+        setTagHealActive(healLocked);
+      }
+
+      if (dt > 0) {
+        let hp = hpRef.current;
+
+        if (damageLocked && hp > 0) {
           const dealt = HP_DRAIN_PER_SEC * dt;
-          hpRef.current = Math.max(0, hpRef.current - dealt);
+          hp = Math.max(0, hp - dealt);
           tagDrainVisualDebtRef.current += dealt;
           while (tagDrainVisualDebtRef.current >= 50) {
             tagDrainVisualDebtRef.current -= 50;
-            spawnDamageFloaterRef.current("-50 HP");
-          }
-          const rounded = Math.round(hpRef.current);
-          setHpDisplay((prev) => (prev !== rounded ? rounded : prev));
-          if (hpRef.current <= 0 && !zeroHpHandledRef.current) {
-            zeroHpHandledRef.current = true;
-            const catcher = lastTagLockScannerRef.current;
-            if (catcher && catcher !== playerId) {
-              publish({
-                type: "player_caught",
-                roomId: roomKey,
-                caughtPlayerId: playerId,
-                catcherPlayerId: catcher,
-                ts: now,
-              });
-              setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: catcher }));
-            } else {
-              zeroHpHandledRef.current = false;
-              hpRef.current = 1;
-              setHpDisplay(1);
-            }
+            spawnCombatFloaterRef.current("-50 HP", "damage");
           }
         }
-      } else {
-        lastHpDamageAtRef.current = now;
-        tagDrainVisualDebtRef.current = 0;
+
+        if (healLocked && hp < MAX_HP) {
+          const gained = HEAL_PER_SEC * dt;
+          hp = Math.min(MAX_HP, hp + gained);
+          tagHealVisualDebtRef.current += gained;
+          while (tagHealVisualDebtRef.current >= HEAL_FLOATER_CHUNK) {
+            tagHealVisualDebtRef.current -= HEAL_FLOATER_CHUNK;
+            spawnCombatFloaterRef.current(`+${HEAL_FLOATER_CHUNK} HP`, "heal");
+          }
+        }
+
+        hpRef.current = hp;
+        const rounded = Math.round(hp);
+        setHpDisplay((prev) => (prev !== rounded ? rounded : prev));
+
+        if (hp <= 0 && damageLocked && !zeroHpHandledRef.current) {
+          zeroHpHandledRef.current = true;
+          const catcher = lastTagLockScannerRef.current;
+          if (catcher && catcher !== playerId) {
+            publish({
+              type: "player_caught",
+              roomId: roomKey,
+              caughtPlayerId: playerId,
+              catcherPlayerId: catcher,
+              ts: now,
+            });
+            setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: catcher }));
+          } else {
+            zeroHpHandledRef.current = false;
+            hpRef.current = 1;
+            setHpDisplay(1);
+          }
+        }
       }
 
       frame = requestAnimationFrame(step);
@@ -611,6 +689,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const onTagIds = useCallback(
     (ids: number[]) => {
       if (!canPlayRef.current || winnerIdRef.current || caughtRef.current[playerId]) return;
+      const role = combatRoleRef.current;
+      if (!role) return;
       const r = rosterRef.current;
       if (!r) return;
       const now = Date.now();
@@ -619,16 +699,30 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (!victimId || victimId === playerId) continue;
         if (caughtRef.current[victimId]) continue;
         if (tid === r.myTagId) continue;
-        const lastPub = lastTagLockPublishRef.current[victimId] ?? 0;
-        if (now - lastPub >= TAG_LOCK_PUBLISH_INTERVAL_MS) {
-          lastTagLockPublishRef.current[victimId] = now;
-          publish({
-            type: "tag_lock",
-            roomId: roomKey,
-            scannerPlayerId: playerId,
-            victimPlayerId: victimId,
-            ts: now,
-          });
+        if (role === "dmg") {
+          const lastPub = lastTagLockPublishRef.current[victimId] ?? 0;
+          if (now - lastPub >= TAG_LOCK_PUBLISH_INTERVAL_MS) {
+            lastTagLockPublishRef.current[victimId] = now;
+            publish({
+              type: "tag_lock",
+              roomId: roomKey,
+              scannerPlayerId: playerId,
+              victimPlayerId: victimId,
+              ts: now,
+            });
+          }
+        } else {
+          const lastPub = lastTagHealPublishRef.current[victimId] ?? 0;
+          if (now - lastPub >= TAG_LOCK_PUBLISH_INTERVAL_MS) {
+            lastTagHealPublishRef.current[victimId] = now;
+            publish({
+              type: "tag_heal",
+              roomId: roomKey,
+              healerPlayerId: playerId,
+              victimPlayerId: victimId,
+              ts: now,
+            });
+          }
         }
       }
       for (const pid of r.sorted) {
@@ -637,6 +731,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (tagNum === undefined) continue;
         if (!ids.includes(tagNum)) {
           delete lastTagLockPublishRef.current[pid];
+          delete lastTagHealPublishRef.current[pid];
         }
       }
 
@@ -657,7 +752,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
     [playerId, publish, roomKey],
   );
 
-  const aprilEnabled = mqttStatus === "live" && !winnerId && !caught[playerId];
+  const aprilEnabled =
+    mqttStatus === "live" && combatRole !== null && !winnerId && !caught[playerId];
   const onScanDebug = useCallback((s: string) => {
     setScanDebug(s);
   }, []);
@@ -681,7 +777,21 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
   const iWon = winnerId === playerId;
 
+  const pickCombatRole = useCallback(
+    (r: CombatRole) => {
+      try {
+        sessionStorage.setItem(combatRoleStorageKey(roomKey), r);
+      } catch {
+        /* private mode */
+      }
+      setCombatRole(r);
+    },
+    [roomKey],
+  );
+
   const showLocationModal = locationHydrated && locationConsent === null;
+  const showCombatRoleModal =
+    combatRoleHydrated && combatRole === null && locationConsent !== null;
 
   return (
     <div className="relative flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
@@ -729,6 +839,46 @@ export function CatchGame({ roomId }: { roomId: string }) {
         </div>
       )}
 
+      {showCombatRoleModal && (
+        <div
+          className="fixed inset-0 z-[2950] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="combat-role-title"
+        >
+          <div className="max-w-md rounded-2xl border border-zinc-600 bg-zinc-900 p-6 shadow-2xl">
+            <h2 id="combat-role-title" className="text-lg font-semibold text-white">
+              Rolle im Raum
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-zinc-300">
+              Mit dem AprilTag wirkt du auf andere Spieler.{" "}
+              <strong className="text-zinc-100">Schaden</strong> entzieht{" "}
+              <strong className="text-red-300">{HP_DRAIN_PER_SEC} HP/s</strong>,{" "}
+              <strong className="text-zinc-100">Heilung</strong> stellt{" "}
+              <strong className="text-emerald-300">{HEAL_PER_SEC} HP/s</strong> wieder her (halber
+              Schaden). Beides kann ein Ziel <strong className="text-zinc-100">gleichzeitig</strong>{" "}
+              treffen (ein Spieler heilt, ein anderer schadet).
+            </p>
+            <div className="mt-6 flex flex-col gap-2 sm:flex-row">
+              <button
+                type="button"
+                onClick={() => pickCombatRole("dmg")}
+                className="flex-1 rounded-xl bg-rose-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-rose-600"
+              >
+                Schaden (DMG)
+              </button>
+              <button
+                type="button"
+                onClick={() => pickCombatRole("heal")}
+                className="flex-1 rounded-xl bg-emerald-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-600"
+              >
+                Heilung (Heal)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {locationConsent === false && (
         <div className="border-b border-amber-800/60 bg-amber-950/90 px-4 py-2.5 text-center text-sm text-amber-100">
           <span className="text-amber-200/90">Standort ist aus</span> – Mitspieler sehen dich nicht
@@ -764,6 +914,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
           <p className="font-mono text-lg font-semibold text-white">{roomKey}</p>
         </div>
         <div className="text-right text-sm">
+          {combatRole && (
+            <p className="mb-1 text-[10px] uppercase tracking-wide text-zinc-500">Rolle</p>
+          )}
+          {combatRole === "dmg" && (
+            <p className="mb-1 text-xs font-semibold text-rose-300">Schaden</p>
+          )}
+          {combatRole === "heal" && (
+            <p className="mb-1 text-xs font-semibold text-emerald-300">Heilung</p>
+          )}
           <p className="text-zinc-500">MQTT</p>
           <p
             className={
@@ -786,9 +945,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
       {mqttStatus === "live" && roster && (
         <div
           className={`sticky top-0 z-[90] border-b px-4 py-2.5 ${
-            tagBeamActive
-              ? "border-red-800/80 bg-red-950/95"
-              : "border-zinc-800 bg-zinc-900/95"
+            tagBeamActive && tagHealActive
+              ? "border-amber-800/80 bg-amber-950/95"
+              : tagBeamActive
+                ? "border-red-800/80 bg-red-950/95"
+                : tagHealActive
+                  ? "border-emerald-800/80 bg-emerald-950/95"
+                  : "border-zinc-800 bg-zinc-900/95"
           } backdrop-blur-sm`}
         >
           <div className="flex items-center justify-between gap-3">
@@ -811,13 +974,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
                   : hpDisplay > 300
                     ? "bg-amber-500"
                     : "bg-red-500"
-              } ${tagBeamActive ? "animate-pulse" : ""}`}
+              } ${tagBeamActive || tagHealActive ? "animate-pulse" : ""}`}
               style={{ width: `${(hpDisplay / MAX_HP) * 100}%` }}
             />
           </div>
           {tagBeamActive && (
             <p className="mt-1.5 text-center text-[11px] font-medium text-red-200/90">
-              AprilTag im Visier eines Gegners – {HP_DRAIN_PER_SEC} HP/s
+              Schaden: AprilTag im Visier – −{HP_DRAIN_PER_SEC} HP/s
+            </p>
+          )}
+          {tagHealActive && (
+            <p className="mt-1 text-center text-[11px] font-medium text-emerald-200/90">
+              Heilung aktiv – +{HEAL_PER_SEC} HP/s
             </p>
           )}
         </div>
@@ -873,25 +1041,48 @@ export function CatchGame({ roomId }: { roomId: string }) {
               <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
             </div>
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
-            {aimHuntTagId !== null && canPlay && !winnerId && roster && (
+            {aimHuntTagId !== null && canPlayWithRole && !winnerId && roster && combatRole && (
               <div className="pointer-events-none absolute left-1/2 top-1/2 z-[32] -translate-x-1/2 -translate-y-[120%]">
-                <div className="rounded-full border-2 border-emerald-400/90 bg-emerald-950/95 px-4 py-2 text-center shadow-lg shadow-emerald-900/40">
-                  <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-300/90">
+                <div
+                  className={`rounded-full border-2 px-4 py-2 text-center shadow-lg ${
+                    combatRole === "heal"
+                      ? "border-emerald-400/90 bg-emerald-950/95 shadow-emerald-900/40"
+                      : "border-rose-400/90 bg-rose-950/95 shadow-rose-900/40"
+                  }`}
+                >
+                  <p
+                    className={`text-[11px] font-semibold uppercase tracking-wider ${
+                      combatRole === "heal" ? "text-emerald-300/90" : "text-rose-300/90"
+                    }`}
+                  >
                     Code erkannt
                   </p>
-                  <p className="mt-0.5 text-lg font-bold tabular-nums text-emerald-50">
+                  <p
+                    className={`mt-0.5 text-lg font-bold tabular-nums ${
+                      combatRole === "heal" ? "text-emerald-50" : "text-rose-50"
+                    }`}
+                  >
                     AprilTag {aimHuntTagId}
                   </p>
-                  <p className="text-[10px] text-emerald-200/80">Im Fadenkreuz · HP-Drain aktiv</p>
+                  <p
+                    className={`text-[10px] ${
+                      combatRole === "heal" ? "text-emerald-200/85" : "text-rose-200/85"
+                    }`}
+                  >
+                    Im Fadenkreuz ·{" "}
+                    {combatRole === "heal"
+                      ? `Heilung +${HEAL_PER_SEC} HP/s`
+                      : `Schaden ${HP_DRAIN_PER_SEC} HP/s`}
+                  </p>
                 </div>
               </div>
             )}
-            {canPlay && !winnerId && roster && (
+            {canPlayWithRole && !winnerId && roster && (
               <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[20] rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
                 <p>
-                  Dein AprilTag: <strong>ID {roster.myTagId}</strong> – zeige ihn den anderen. Du
-                  darfst <strong>jeden anderen</strong> Spieler jagen (AprilTag seiner Nummer
-                  scannen).
+                  Dein AprilTag: <strong>ID {roster.myTagId}</strong> · Rolle:{" "}
+                  <strong>{combatRole === "heal" ? "Heilung" : "Schaden"}</strong> – richte die
+                  Kamera auf die <strong>Tag-Nummer</strong> eines anderen Spielers.
                 </p>
                 <p className="mt-1 text-xs text-zinc-300">
                   Jagbare Tag-IDs jetzt:{" "}
@@ -967,13 +1158,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
           <button
             type="button"
             onClick={startStormMode}
-            disabled={!canPlay || iAmCaught || !!winnerId || stormOnCooldown}
+            disabled={!canPlayWithRole || iAmCaught || !!winnerId || stormOnCooldown}
             title={
-              !canPlay && !winnerId
-                ? "Ab zwei Spielern im Raum nutzbar."
-                : stormOnCooldown
-                  ? `Sturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
-                  : undefined
+              !combatRole && !winnerId
+                ? "Zuerst Rolle wählen (Dialog oben)."
+                : !canPlay && !winnerId
+                  ? "Ab zwei Spielern im Raum nutzbar."
+                  : stormOnCooldown
+                    ? `Sturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
+                    : undefined
             }
             className="w-full rounded-lg border border-transparent px-4 py-3 text-sm font-medium transition enabled:border-violet-500/40 enabled:bg-violet-700 enabled:text-white enabled:hover:bg-violet-600 disabled:cursor-not-allowed disabled:border-violet-900/50 disabled:bg-violet-950/50 disabled:text-violet-200/70"
           >
@@ -984,11 +1177,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
           <button
             type="button"
             onClick={sendDroneJam}
-            disabled={!canPlay || iAmCaught || !!winnerId || droneJamOnCooldown}
+            disabled={!canPlayWithRole || iAmCaught || !!winnerId || droneJamOnCooldown}
             title={
-              !canPlay && !winnerId
-                ? "Ab zwei Spielern im Raum nutzbar."
-                : droneJamOnCooldown
+              !combatRole && !winnerId
+                ? "Zuerst Rolle wählen (Dialog oben)."
+                : !canPlay && !winnerId
+                  ? "Ab zwei Spielern im Raum nutzbar."
+                  : droneJamOnCooldown
                   ? `Drohnen-Störung abklingend (${Math.ceil((droneJamCooldownUntil - nowTick) / 1000)} s)`
                   : "Andere sehen 20 s nur Rauschen über dem Kamerabild (Karte & Steuerung bleiben normal)."
             }
@@ -1027,6 +1222,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
         </div>
         <div className="mt-3 space-y-1 text-xs text-zinc-500">
+          {canPlay && !combatRole && !winnerId && (
+            <p className="text-sky-200/90">
+              <strong className="text-sky-100">Rolle fehlt:</strong> Wähle im Dialog{" "}
+              <strong className="text-sky-50">Schaden</strong> oder <strong className="text-sky-50">Heilung</strong>,
+              um AprilTag und Spezialaktionen zu nutzen.
+            </p>
+          )}
           {!canPlay && !winnerId && (
             <p className="text-amber-200/80">
               <strong className="text-amber-100">Drohnen-Störung &amp; Sturm:</strong> sichtbar als

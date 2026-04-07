@@ -1,6 +1,10 @@
 "use client";
 
-export type HpFloaterItem = { id: string; text: string };
+export type HpFloaterItem = {
+  id: string;
+  text: string;
+  variant?: "damage" | "heal";
+};
 
 type Props = {
   items: HpFloaterItem[];
@@ -24,7 +28,13 @@ export function HpDamageFloaters({ items }: Props) {
             className="absolute top-[42%]"
             style={{ left: `calc(50% + ${jitter}px)` }}
           >
-            <span className="hp-damage-float inline-block text-3xl font-black tracking-tight text-red-400 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] sm:text-4xl">
+            <span
+              className={`hp-damage-float inline-block text-3xl font-black tracking-tight sm:text-4xl ${
+                f.variant === "heal"
+                  ? "text-emerald-400 drop-shadow-[0_2px_12px_rgba(6,95,70,0.95)]"
+                  : "text-red-400 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]"
+              }`}
+            >
               {f.text}
             </span>
           </div>

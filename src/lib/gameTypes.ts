@@ -54,6 +54,13 @@ export type GameMessage =
       scannerPlayerId: string;
       victimPlayerId: string;
       ts: number;
+    }
+  | {
+      type: "tag_heal";
+      roomId: string;
+      healerPlayerId: string;
+      victimPlayerId: string;
+      ts: number;
     };
 
 export function parseGameMessage(raw: string): GameMessage | null {
