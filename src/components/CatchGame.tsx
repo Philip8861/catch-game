@@ -95,6 +95,23 @@ function vibrateOnWeaponHit(isCrit: boolean) {
   }
 }
 
+/** Haptik auf dem Schützen-Gerät beim Abgeben eines Schusses (Halbauto kurz, Sniper kräftiger). */
+function vibrateOnWeaponFired(weapon: WeaponType, isCrit: boolean) {
+  if (typeof navigator === "undefined") return;
+  if (typeof navigator.vibrate !== "function") return;
+  let pattern: number[];
+  if (weapon === "sniper") {
+    pattern = isCrit ? [38, 22, 52] : [32];
+  } else {
+    pattern = isCrit ? [18, 10, 24] : [12];
+  }
+  try {
+    navigator.vibrate(pattern);
+  } catch {
+    /* oft nur nach vorheriger Nutzerinteraktion (z. B. Feuer-Knopf) */
+  }
+}
+
 export function CatchGame({ roomId }: { roomId: string }) {
   const roomKey = useMemo(() => roomId.trim().toUpperCase(), [roomId]);
   const playerId = useMemo(() => getOrCreatePlayerId(), []);
@@ -843,6 +860,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 isCrit: crit,
                 ts: now,
               });
+              vibrateOnWeaponFired("sniper", crit);
             }
           } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
             lastSemiShotAtRef.current = now;
@@ -865,6 +883,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               isCrit: crit,
               ts: now,
             });
+            vibrateOnWeaponFired("semi", crit);
           }
         }
 
