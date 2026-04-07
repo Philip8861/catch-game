@@ -1283,9 +1283,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
               className="pointer-events-none absolute inset-0 z-[15] flex items-center justify-center"
               aria-hidden
             >
-              <div className="absolute left-1/2 top-0 bottom-0 w-[2px] -translate-x-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
-              <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
-              <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+              {combatRole === "dmg" && weaponChoice === "semi" ? (
+                <div
+                  className="absolute left-1/2 top-1/2 size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500 shadow-[0_0_4px_#fff,0_0_10px_rgba(239,68,68,1),0_0_22px_rgba(220,38,38,0.65)] ring-[2px] ring-red-950/50"
+                  aria-label="Rotpunktvisier"
+                />
+              ) : (
+                <>
+                  <div className="absolute left-1/2 top-0 bottom-0 w-[2px] -translate-x-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                  <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                  <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                </>
+              )}
             </div>
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
             {aimHuntTagId !== null && canPlayWithRole && !winnerId && roster && combatRole && (
@@ -1316,7 +1325,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       combatRole === "heal" ? "text-emerald-200/85" : "text-rose-200/85"
                     }`}
                   >
-                    Im Fadenkreuz ·{" "}
+                    {combatRole === "dmg" && weaponChoice === "semi"
+                      ? "Im Rotpunkt · "
+                      : "Im Fadenkreuz · "}
                     {combatRole === "heal"
                       ? `Heilung +${HEAL_PER_SEC} HP/s`
                       : weaponChoice === "sniper"
