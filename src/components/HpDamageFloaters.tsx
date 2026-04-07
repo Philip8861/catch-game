@@ -3,7 +3,7 @@
 export type HpFloaterItem = {
   id: string;
   text: string;
-  variant?: "damage" | "heal";
+  variant?: "damage" | "heal" | "crit";
 };
 
 type Props = {
@@ -29,10 +29,12 @@ export function HpDamageFloaters({ items }: Props) {
             style={{ left: `calc(50% + ${jitter}px)` }}
           >
             <span
-              className={`hp-damage-float inline-block text-3xl font-black tracking-tight sm:text-4xl ${
+              className={`hp-damage-float inline-block font-black tracking-tight ${
                 f.variant === "heal"
-                  ? "text-emerald-400 drop-shadow-[0_2px_12px_rgba(6,95,70,0.95)]"
-                  : "text-red-400 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]"
+                  ? "text-3xl sm:text-4xl text-emerald-400 drop-shadow-[0_2px_12px_rgba(6,95,70,0.95)]"
+                  : f.variant === "crit"
+                    ? "hp-damage-crit text-5xl sm:text-6xl text-amber-200"
+                    : "text-3xl sm:text-4xl text-red-400 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]"
               }`}
             >
               {f.text}

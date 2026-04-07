@@ -54,6 +54,8 @@ export type GameMessage =
       scannerPlayerId: string;
       victimPlayerId: string;
       ts: number;
+      /** 0–1, vom DMG-Spieler; fehlt bei alten Clients → 10 % */
+      critChance?: number;
     }
   | {
       type: "tag_heal";

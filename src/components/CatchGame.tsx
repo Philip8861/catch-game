@@ -47,7 +47,15 @@ const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
 const MAX_HP = 1000;
-const HP_DRAIN_PER_SEC = 50;
+/** Schaden pro Treffer (Basis); Crit = doppelter Abzug (25 → 50). */
+const DMG_CHUNK_HP = 25;
+const DMG_CRIT_MULT = 2;
+/** DPS schwankt jede Sekunde im Intervall (Pool füllt Treffer à 25). */
+const DMG_DPS_MIN = 5;
+const DMG_DPS_MAX = 25;
+const DEFAULT_CRIT_CHANCE = 0.1;
+const DMG_CRIT_PCT_MIN = 10;
+const DMG_CRIT_PCT_MAX = 100;
 const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
@@ -55,6 +63,10 @@ const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
 
 function combatRoleStorageKey(roomKey: string) {
   return `catch-game-combat-role:${roomKey}`;
+}
+
+function dmgCritPctStorageKey(roomKey: string) {
+  return `catch-game-dmg-crit-pct:${roomKey}`;
 }
 
 type ViewMode = "map" | "camera";
@@ -91,12 +103,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [hpDisplay, setHpDisplay] = useState(MAX_HP);
   const [tagBeamActive, setTagBeamActive] = useState(false);
   const [hpFloaters, setHpFloaters] = useState<
-    Array<{ id: string; text: string; variant?: "damage" | "heal" }>
+    Array<{ id: string; text: string; variant?: "damage" | "heal" | "crit" }>
   >([]);
   const [aimHuntTagId, setAimHuntTagId] = useState<number | null>(null);
   const [combatRoleHydrated, setCombatRoleHydrated] = useState(false);
   const [combatRole, setCombatRole] = useState<CombatRole | null>(null);
   const [tagHealActive, setTagHealActive] = useState(false);
+  const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -115,10 +128,14 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const zeroHpHandledRef = useRef(false);
   const lastTagLockPublishRef = useRef<Record<string, number>>({});
   const lastTagHealPublishRef = useRef<Record<string, number>>({});
-  const tagDrainVisualDebtRef = useRef(0);
   const tagHealVisualDebtRef = useRef(0);
+  const tagDamagePoolRef = useRef(0);
+  const tagDrainDpsRef = useRef(DMG_DPS_MIN);
+  const lastDpsSampleAtRef = useRef(0);
+  const incomingTagCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
+  const dmgCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
   const spawnCombatFloaterRef = useRef<
-    (text: string, variant?: "damage" | "heal") => void
+    (text: string, variant?: "damage" | "heal" | "crit") => void
   >(() => {});
   const prevAimHuntTagRef = useRef<number | null>(null);
   const combatRoleRef = useRef<CombatRole | null>(null);
@@ -128,7 +145,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   useLayoutEffect(() => {
     spawnCombatFloaterRef.current = (
       text: string,
-      variant: "damage" | "heal" = "damage",
+      variant: "damage" | "heal" | "crit" = "damage",
     ) => {
       const id = `f-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       setHpFloaters((prev) => [...prev.slice(-24), { id, text, variant }]);
@@ -155,6 +172,43 @@ export function CatchGame({ roomId }: { roomId: string }) {
     }, 0);
     return () => clearTimeout(t);
   }, [roomKey]);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        const raw = sessionStorage.getItem(dmgCritPctStorageKey(roomKey));
+        const n = raw !== null ? Number(raw) : NaN;
+        if (Number.isFinite(n)) {
+          const c = Math.round(
+            Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, n)),
+          );
+          setDmgCritPercent(c);
+        }
+      } catch {
+        /* */
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, [roomKey]);
+
+  useLayoutEffect(() => {
+    dmgCritChanceRef.current = dmgCritPercent / 100;
+  }, [dmgCritPercent]);
+
+  const onDmgCritPercentChange = useCallback(
+    (v: number) => {
+      const c = Math.round(
+        Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, v)),
+      );
+      setDmgCritPercent(c);
+      try {
+        sessionStorage.setItem(dmgCritPctStorageKey(roomKey), String(c));
+      } catch {
+        /* */
+      }
+    },
+    [roomKey],
+  );
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -370,6 +424,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
         const t = Date.now();
         tagDamageLockUntilRef.current = t + TAG_LOCK_TTL_MS;
         lastTagLockScannerRef.current = msg.scannerPlayerId;
+        const cc = msg.critChance;
+        incomingTagCritChanceRef.current =
+          typeof cc === "number" && Number.isFinite(cc)
+            ? Math.min(1, Math.max(0, cc))
+            : DEFAULT_CRIT_CHANCE;
       }
       if (msg.type === "tag_heal") {
         if (msg.victimPlayerId !== playerId) return;
@@ -444,6 +503,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagLockPublishRef.current = {};
     lastTagHealPublishRef.current = {};
     tagHealVisualDebtRef.current = 0;
+    tagDamagePoolRef.current = 0;
+    incomingTagCritChanceRef.current = DEFAULT_CRIT_CHANCE;
     window.queueMicrotask(() => {
       setHpDisplay(MAX_HP);
       setHpFloaters([]);
@@ -614,7 +675,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
       if (prevDamageLockedRef.current !== damageLocked) {
         prevDamageLockedRef.current = damageLocked;
-        tagDrainVisualDebtRef.current = 0;
+        tagDamagePoolRef.current = 0;
+        if (damageLocked) {
+          tagDrainDpsRef.current =
+            DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
+          lastDpsSampleAtRef.current = now;
+        }
       }
       if (prevHealLockedRef.current !== healLocked) {
         prevHealLockedRef.current = healLocked;
@@ -634,12 +700,23 @@ export function CatchGame({ roomId }: { roomId: string }) {
         let hp = hpRef.current;
 
         if (damageLocked && hp > 0) {
-          const dealt = HP_DRAIN_PER_SEC * dt;
-          hp = Math.max(0, hp - dealt);
-          tagDrainVisualDebtRef.current += dealt;
-          while (tagDrainVisualDebtRef.current >= 50) {
-            tagDrainVisualDebtRef.current -= 50;
-            spawnCombatFloaterRef.current("-50 HP", "damage");
+          if (now - lastDpsSampleAtRef.current >= 1000) {
+            tagDrainDpsRef.current =
+              DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
+            lastDpsSampleAtRef.current = now;
+          }
+          tagDamagePoolRef.current += tagDrainDpsRef.current * dt;
+          const critP = incomingTagCritChanceRef.current;
+          while (tagDamagePoolRef.current >= DMG_CHUNK_HP && hp > 0) {
+            tagDamagePoolRef.current -= DMG_CHUNK_HP;
+            const crit = Math.random() < critP;
+            const dmg = crit ? DMG_CHUNK_HP * DMG_CRIT_MULT : DMG_CHUNK_HP;
+            hp = Math.max(0, hp - dmg);
+            if (crit) {
+              spawnCombatFloaterRef.current("-50 CRIT!", "crit");
+            } else {
+              spawnCombatFloaterRef.current("-25 HP", "damage");
+            }
           }
         }
 
@@ -708,6 +785,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               roomId: roomKey,
               scannerPlayerId: playerId,
               victimPlayerId: victimId,
+              critChance: dmgCritChanceRef.current,
               ts: now,
             });
           }
@@ -852,8 +930,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
             </h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-300">
               Mit dem AprilTag wirkt du auf andere Spieler.{" "}
-              <strong className="text-zinc-100">Schaden</strong> entzieht{" "}
-              <strong className="text-red-300">{HP_DRAIN_PER_SEC} HP/s</strong>,{" "}
+              <strong className="text-zinc-100">Schaden</strong> entzieht typisch{" "}
+              <strong className="text-red-300">
+                {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s
+              </strong>{" "}
+              (schwankend), Treffer 25 HP, Crit ×2 (50). Standard-Crit{" "}
+              <strong className="text-amber-200/90">{DMG_CRIT_PCT_MIN}%</strong>, als DMG-Spieler per
+              Regler bis {DMG_CRIT_PCT_MAX}%.{" "}
               <strong className="text-zinc-100">Heilung</strong> stellt{" "}
               <strong className="text-emerald-300">{HEAL_PER_SEC} HP/s</strong> wieder her (halber
               Schaden). Beides kann ein Ziel <strong className="text-zinc-100">gleichzeitig</strong>{" "}
@@ -980,8 +1063,34 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
           {tagBeamActive && (
             <p className="mt-1.5 text-center text-[11px] font-medium text-red-200/90">
-              Schaden: AprilTag im Visier – −{HP_DRAIN_PER_SEC} HP/s
+              Schaden: AprilTag im Visier – ca. {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s, Treffer 25 / Crit 50
             </p>
+          )}
+          {combatRole === "dmg" && (
+            <div className="mt-2 rounded-lg border border-rose-900/50 bg-rose-950/50 px-3 py-2">
+              <label className="flex flex-col gap-1.5 text-left text-[11px] text-rose-100/95">
+                <span className="flex items-center justify-between gap-2 font-medium">
+                  <span>Crit-Chance (dein DMG)</span>
+                  <span className="tabular-nums text-rose-200">{dmgCritPercent}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={DMG_CRIT_PCT_MIN}
+                  max={DMG_CRIT_PCT_MAX}
+                  step={1}
+                  value={dmgCritPercent}
+                  onChange={(e) => onDmgCritPercentChange(Number(e.target.value))}
+                  className="h-2 w-full cursor-pointer accent-rose-400"
+                  aria-valuemin={DMG_CRIT_PCT_MIN}
+                  aria-valuemax={DMG_CRIT_PCT_MAX}
+                  aria-valuenow={dmgCritPercent}
+                  aria-label="Crit-Chance für Schaden"
+                />
+                <span className="text-[10px] leading-snug text-rose-200/75">
+                  Gegner erhalten pro Treffer 25 HP; bei Crit 50 HP. Crit-Text ist größer und leuchtet.
+                </span>
+              </label>
+            </div>
           )}
           {tagHealActive && (
             <p className="mt-1 text-center text-[11px] font-medium text-emerald-200/90">
@@ -1072,7 +1181,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
                     Im Fadenkreuz ·{" "}
                     {combatRole === "heal"
                       ? `Heilung +${HEAL_PER_SEC} HP/s`
-                      : `Schaden ${HP_DRAIN_PER_SEC} HP/s`}
+                      : `Schaden ca. ${DMG_DPS_MIN}–${DMG_DPS_MAX} HP/s`}
                   </p>
                 </div>
               </div>

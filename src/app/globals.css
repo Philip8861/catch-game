@@ -43,3 +43,19 @@ body {
 .hp-damage-float {
   animation: hp-damage-pop 0.85s ease-out forwards;
 }
+
+@keyframes hp-crit-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 14px rgba(250, 204, 21, 0.95))
+      drop-shadow(0 0 28px rgba(251, 191, 36, 0.65));
+  }
+  50% {
+    filter: drop-shadow(0 0 22px rgba(254, 240, 138, 1))
+      drop-shadow(0 0 40px rgba(250, 204, 21, 0.85));
+  }
+}
+
+.hp-damage-crit {
+  animation: hp-damage-pop 0.95s ease-out forwards, hp-crit-glow 0.45s ease-in-out infinite;
+}
