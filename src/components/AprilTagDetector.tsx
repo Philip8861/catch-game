@@ -13,22 +13,98 @@ type ApriltagApi = {
   set_camera_info: (fx: number, fy: number, cx: number, cy: number) => Promise<void>;
 };
 
-function parseDetectionIds(detections: unknown): number[] {
-  if (Array.isArray(detections)) {
-    return detections
-      .map((det) => {
-        if (det && typeof det === "object" && "id" in det) {
-          const id = (det as { id: unknown }).id;
-          return typeof id === "number" ? id : Number(id);
-        }
-        return NaN;
-      })
-      .filter((n) => Number.isFinite(n));
-  }
+/** Anteil von min(Breite,Höhe): nur Tags, deren Mittelpunkt hier liegt, zählen (Fadenkreuz). */
+const CROSSHAIR_RADIUS_FRAC = 0.16;
+
+function detectionArray(detections: unknown): unknown[] {
+  if (Array.isArray(detections)) return detections;
   if (detections && typeof detections === "object" && "tags" in detections) {
-    return parseDetectionIds((detections as { tags: unknown }).tags);
+    const t = (detections as { tags: unknown }).tags;
+    return Array.isArray(t) ? t : [];
   }
   return [];
+}
+
+function readCenter(det: Record<string, unknown>): { cx: number; cy: number } | null {
+  const c = det.center;
+  if (Array.isArray(c) && c.length >= 2) {
+    const cx = Number(c[0]);
+    const cy = Number(c[1]);
+    if (Number.isFinite(cx) && Number.isFinite(cy)) return { cx, cy };
+  }
+  if (c && typeof c === "object") {
+    const o = c as Record<string, unknown>;
+    const cx = Number(o.x ?? o.X);
+    const cy = Number(o.y ?? o.Y);
+    if (Number.isFinite(cx) && Number.isFinite(cy)) return { cx, cy };
+  }
+  const corners = det.corners;
+  if (Array.isArray(corners) && corners.length >= 2) {
+    let sx = 0;
+    let sy = 0;
+    let n = 0;
+    for (const p of corners) {
+      if (Array.isArray(p) && p.length >= 2) {
+        sx += Number(p[0]);
+        sy += Number(p[1]);
+        n++;
+      } else if (p && typeof p === "object") {
+        const q = p as Record<string, unknown>;
+        const x = Number(q.x ?? q[0]);
+        const y = Number(q.y ?? q[1]);
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          sx += x;
+          sy += y;
+          n++;
+        }
+      }
+    }
+    if (n > 0) return { cx: sx / n, cy: sy / n };
+  }
+  return null;
+}
+
+function parseDetectionsInCrosshair(
+  detections: unknown,
+  imgW: number,
+  imgH: number,
+): { ids: number[]; outsideIds: number[] } {
+  const arr = detectionArray(detections);
+  const midX = imgW / 2;
+  const midY = imgH / 2;
+  const r = Math.min(imgW, imgH) * CROSSHAIR_RADIUS_FRAC;
+  const r2 = r * r;
+
+  const inside: number[] = [];
+  const outside: number[] = [];
+
+  for (const det of arr) {
+    if (!det || typeof det !== "object") continue;
+    const d = det as Record<string, unknown>;
+    const idRaw = d.id;
+    const id = typeof idRaw === "number" ? idRaw : Number(idRaw);
+    if (!Number.isFinite(id)) continue;
+    const pos = readCenter(d);
+    if (!pos) continue;
+    const dx = pos.cx - midX;
+    const dy = pos.cy - midY;
+    if (dx * dx + dy * dy <= r2) inside.push(id);
+    else outside.push(id);
+  }
+
+  return { ids: inside, outsideIds: outside };
+}
+
+function parseDetectionIds(detections: unknown): number[] {
+  return detectionArray(detections)
+    .map((det) => {
+      if (det && typeof det === "object" && "id" in det) {
+        const id = (det as { id: unknown }).id;
+        return typeof id === "number" ? id : Number(id);
+      }
+      return NaN;
+    })
+    .filter((n) => Number.isFinite(n));
 }
 
 /** tag36h11: bekannte Größe für Erkennung (PoC), IDs 1 … MAX */
@@ -109,9 +185,36 @@ export function useAprilTagDetector(
             gray[j] = Math.round((d[i]! + d[i + 1]! + d[i + 2]!) / 3);
           }
           const detections = await api.detect(gray, w, h);
-          const ids = parseDetectionIds(detections);
-          onTagIdsRef.current(ids);
-          dbg(ids.length ? `Tags: ${ids.join(", ")}` : "kein Tag");
+          const { ids, outsideIds } = parseDetectionsInCrosshair(detections, w, h);
+          const anyId = parseDetectionIds(detections);
+
+          if (anyId.length && ids.length === 0 && outsideIds.length === 0) {
+            const m = Math.min(w, h);
+            const s = Math.max(96, Math.floor(m * 0.38));
+            const ox = Math.floor((w - s) / 2);
+            const oy = Math.floor((h - s) / 2);
+            const sub = new Uint8Array(s * s);
+            for (let j = 0; j < s; j++) {
+              sub.set(gray.subarray(ox + (oy + j) * w, ox + s + (oy + j) * w), j * s);
+            }
+            const subDet = await api.detect(sub, s, s);
+            const cropIds = parseDetectionIds(subDet);
+            onTagIdsRef.current(cropIds);
+            dbg(
+              cropIds.length
+                ? `Im Zentrum (Crop): ${cropIds.join(", ")}`
+                : `Tag erkannt, aber nicht in der Bildmitte (${anyId.join(", ")})`,
+            );
+          } else {
+            onTagIdsRef.current(ids);
+            if (ids.length) {
+              dbg(`Im Fadenkreuz: ${ids.join(", ")}`);
+            } else if (outsideIds.length) {
+              dbg(`Tag(s) außerhalb Mitte: ${outsideIds.join(", ")}`);
+            } else {
+              dbg("kein Tag");
+            }
+          }
         } catch (e) {
           dbg(`Fehler: ${e instanceof Error ? e.message : "Scan"}`);
         }
