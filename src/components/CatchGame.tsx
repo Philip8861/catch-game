@@ -83,6 +83,22 @@ function topicForRoom(roomKey: string) {
   return `catch-game/demo/${roomKey}`;
 }
 
+/** Kurzes Haptik-Feedback für das getroffene Gerät (Android u. a.; iOS Safari meist ohne API). */
+function vibrateOnWeaponHit(isCrit: boolean) {
+  if (typeof navigator === "undefined") return;
+  const v = navigator.vibrate;
+  if (typeof v !== "function") return;
+  try {
+    if (isCrit) {
+      v.call(navigator, [55, 40, 65]);
+    } else {
+      v.call(navigator, 42);
+    }
+  } catch {
+    /* manche Browser/WebViews blocken ohne User-Gesture */
+  }
+}
+
 export function CatchGame({ roomId }: { roomId: string }) {
   const roomKey = useMemo(() => roomId.trim().toUpperCase(), [roomId]);
   const playerId = useMemo(() => getOrCreatePlayerId(), []);
@@ -491,12 +507,13 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (zeroHpHandledRef.current) return;
         const nextHp = Math.max(0, hpRef.current - dmg);
         hpRef.current = nextHp;
+        const isCrit = msg.isCrit === true;
+        vibrateOnWeaponHit(isCrit);
         window.queueMicrotask(() => {
           setHpDisplay(Math.round(nextHp));
         });
         const w = msg.weapon;
         const label = w === "sniper" ? "Sniper" : w === "semi" ? "Halbauto" : "";
-        const isCrit = msg.isCrit === true;
         if (isCrit) {
           spawnCombatFloaterRef.current(
             label ? `-${dmg} CRIT! (${label})` : `-${dmg} CRIT!`,
