@@ -54,8 +54,16 @@ export type GameMessage =
       scannerPlayerId: string;
       victimPlayerId: string;
       ts: number;
-      /** 0–1, vom DMG-Spieler; fehlt bei alten Clients → 10 % */
-      critChance?: number;
+    }
+  | {
+      type: "weapon_hit";
+      roomId: string;
+      hitId: string;
+      shooterPlayerId: string;
+      victimPlayerId: string;
+      damage: number;
+      weapon: "sniper" | "semi";
+      ts: number;
     }
   | {
       type: "tag_heal";

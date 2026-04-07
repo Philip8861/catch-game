@@ -47,17 +47,12 @@ const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
 const MAX_HP = 1000;
-/** Crit verdoppelt den Schaden des jeweiligen 250-ms-Ticks. */
-const DMG_CRIT_MULT = 2;
-/** Pro Tick neu gezogene Momentan-DPS (Zielband 5–25 HP/s über mehrere Ticks). */
-const DMG_DPS_MIN = 5;
-const DMG_DPS_MAX = 25;
-const DMG_TICK_MS = 250;
-/** Max. Ticks pro Frame (Tab-Hintergrund), verhindert Einmal-Burst. */
-const DMG_TICK_CATCHUP_MAX = 12;
-const DEFAULT_CRIT_CHANCE = 0.1;
-const DMG_CRIT_PCT_MIN = 10;
-const DMG_CRIT_PCT_MAX = 100;
+const SNIPER_COOLDOWN_MS = 2000;
+const SNIPER_DMG_MIN = 40;
+const SNIPER_DMG_MAX = 90;
+const SEMI_COOLDOWN_MS = 500;
+const SEMI_DMG_MIN = 15;
+const SEMI_DMG_MAX = 35;
 const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
@@ -67,12 +62,13 @@ function combatRoleStorageKey(roomKey: string) {
   return `catch-game-combat-role:${roomKey}`;
 }
 
-function dmgCritPctStorageKey(roomKey: string) {
-  return `catch-game-dmg-crit-pct:${roomKey}`;
+function weaponStorageKey(roomKey: string) {
+  return `catch-game-weapon:${roomKey}`;
 }
 
 type ViewMode = "map" | "camera";
 type CombatRole = "dmg" | "heal";
+type WeaponType = "sniper" | "semi";
 
 function topicForRoom(roomKey: string) {
   return `catch-game/demo/${roomKey}`;
@@ -111,7 +107,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [combatRoleHydrated, setCombatRoleHydrated] = useState(false);
   const [combatRole, setCombatRole] = useState<CombatRole | null>(null);
   const [tagHealActive, setTagHealActive] = useState(false);
-  const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
+  const [weaponChoice, setWeaponChoice] = useState<WeaponType>("sniper");
+  const [firePressed, setFirePressed] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -131,9 +128,12 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const lastTagLockPublishRef = useRef<Record<string, number>>({});
   const lastTagHealPublishRef = useRef<Record<string, number>>({});
   const tagHealVisualDebtRef = useRef(0);
-  const lastTagDamageTickAtRef = useRef(0);
-  const incomingTagCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
-  const dmgCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
+  const processedWeaponHitIdsRef = useRef<string[]>([]);
+  const fireHeldRef = useRef(false);
+  const aimVictimPlayerIdRef = useRef<string | null>(null);
+  const weaponTypeRef = useRef<WeaponType>("sniper");
+  const lastSniperShotAtRef = useRef(0);
+  const lastSemiShotAtRef = useRef(0);
   const spawnCombatFloaterRef = useRef<
     (text: string, variant?: "damage" | "heal" | "crit") => void
   >(() => {});
@@ -159,6 +159,35 @@ export function CatchGame({ roomId }: { roomId: string }) {
     combatRoleRef.current = combatRole;
   }, [combatRole]);
 
+  useLayoutEffect(() => {
+    weaponTypeRef.current = weaponChoice;
+  }, [weaponChoice]);
+
+  useEffect(() => {
+    const release = () => {
+      fireHeldRef.current = false;
+      setFirePressed(false);
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    return () => {
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+    };
+  }, []);
+
+  const pickWeapon = useCallback(
+    (w: WeaponType) => {
+      setWeaponChoice(w);
+      try {
+        sessionStorage.setItem(weaponStorageKey(roomKey), w);
+      } catch {
+        /* */
+      }
+    },
+    [roomKey],
+  );
+
   useEffect(() => {
     const t = window.setTimeout(() => {
       try {
@@ -176,39 +205,14 @@ export function CatchGame({ roomId }: { roomId: string }) {
   useEffect(() => {
     const t = window.setTimeout(() => {
       try {
-        const raw = sessionStorage.getItem(dmgCritPctStorageKey(roomKey));
-        const n = raw !== null ? Number(raw) : NaN;
-        if (Number.isFinite(n)) {
-          const c = Math.round(
-            Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, n)),
-          );
-          setDmgCritPercent(c);
-        }
+        const w = sessionStorage.getItem(weaponStorageKey(roomKey));
+        if (w === "sniper" || w === "semi") setWeaponChoice(w);
       } catch {
         /* */
       }
     }, 0);
     return () => clearTimeout(t);
   }, [roomKey]);
-
-  useLayoutEffect(() => {
-    dmgCritChanceRef.current = dmgCritPercent / 100;
-  }, [dmgCritPercent]);
-
-  const onDmgCritPercentChange = useCallback(
-    (v: number) => {
-      const c = Math.round(
-        Math.min(DMG_CRIT_PCT_MAX, Math.max(DMG_CRIT_PCT_MIN, v)),
-      );
-      setDmgCritPercent(c);
-      try {
-        sessionStorage.setItem(dmgCritPctStorageKey(roomKey), String(c));
-      } catch {
-        /* */
-      }
-    },
-    [roomKey],
-  );
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -424,11 +428,48 @@ export function CatchGame({ roomId }: { roomId: string }) {
         const t = Date.now();
         tagDamageLockUntilRef.current = t + TAG_LOCK_TTL_MS;
         lastTagLockScannerRef.current = msg.scannerPlayerId;
-        const cc = msg.critChance;
-        incomingTagCritChanceRef.current =
-          typeof cc === "number" && Number.isFinite(cc)
-            ? Math.min(1, Math.max(0, cc))
-            : DEFAULT_CRIT_CHANCE;
+      }
+      if (msg.type === "weapon_hit") {
+        if (msg.roomId !== roomKey) return;
+        if (msg.victimPlayerId !== playerId) return;
+        const seen = processedWeaponHitIdsRef.current;
+        if (seen.includes(msg.hitId)) return;
+        seen.push(msg.hitId);
+        if (seen.length > 120) seen.splice(0, 60);
+        let dmg = msg.damage;
+        if (typeof dmg !== "number" || !Number.isFinite(dmg)) return;
+        dmg = Math.max(1, Math.min(500, Math.round(dmg)));
+        if (zeroHpHandledRef.current) return;
+        const nextHp = Math.max(0, hpRef.current - dmg);
+        hpRef.current = nextHp;
+        window.queueMicrotask(() => {
+          setHpDisplay(Math.round(nextHp));
+        });
+        const w = msg.weapon;
+        const label = w === "sniper" ? "Sniper" : w === "semi" ? "Halbauto" : "";
+        spawnCombatFloaterRef.current(
+          label ? `-${dmg} (${label})` : `-${dmg} HP`,
+          "damage",
+        );
+        if (nextHp <= 0 && !zeroHpHandledRef.current) {
+          zeroHpHandledRef.current = true;
+          const catcher = lastTagLockScannerRef.current;
+          const ts = Date.now();
+          if (catcher && catcher !== playerId) {
+            publish({
+              type: "player_caught",
+              roomId: roomKey,
+              caughtPlayerId: playerId,
+              catcherPlayerId: catcher,
+              ts,
+            });
+            setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: catcher }));
+          } else {
+            zeroHpHandledRef.current = false;
+            hpRef.current = 1;
+            setHpDisplay(1);
+          }
+        }
       }
       if (msg.type === "tag_heal") {
         if (msg.victimPlayerId !== playerId) return;
@@ -503,8 +544,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagLockPublishRef.current = {};
     lastTagHealPublishRef.current = {};
     tagHealVisualDebtRef.current = 0;
-    lastTagDamageTickAtRef.current = 0;
-    incomingTagCritChanceRef.current = DEFAULT_CRIT_CHANCE;
+    processedWeaponHitIdsRef.current = [];
+    fireHeldRef.current = false;
+    aimVictimPlayerIdRef.current = null;
+    window.queueMicrotask(() => setFirePressed(false));
     window.queueMicrotask(() => {
       setHpDisplay(MAX_HP);
       setHpFloaters([]);
@@ -675,9 +718,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
       if (prevDamageLockedRef.current !== damageLocked) {
         prevDamageLockedRef.current = damageLocked;
-        if (damageLocked) {
-          lastTagDamageTickAtRef.current = now - DMG_TICK_MS;
-        }
       }
       if (prevHealLockedRef.current !== healLocked) {
         prevHealLockedRef.current = healLocked;
@@ -696,30 +736,55 @@ export function CatchGame({ roomId }: { roomId: string }) {
       if (dt > 0) {
         let hp = hpRef.current;
 
-        if (damageLocked && hp > 0) {
-          const critP = incomingTagCritChanceRef.current;
-          let catchup = 0;
-          while (
-            now - lastTagDamageTickAtRef.current >= DMG_TICK_MS &&
-            hp > 0 &&
-            catchup < DMG_TICK_CATCHUP_MAX
-          ) {
-            catchup++;
-            lastTagDamageTickAtRef.current += DMG_TICK_MS;
-            const tickDps =
-              DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
-            let tickDmg = Math.max(
-              1,
-              Math.round(tickDps * (DMG_TICK_MS / 1000)),
-            );
-            const crit = Math.random() < critP;
-            if (crit) tickDmg *= DMG_CRIT_MULT;
-            hp = Math.max(0, hp - tickDmg);
-            if (crit) {
-              spawnCombatFloaterRef.current(`-${tickDmg} CRIT!`, "crit");
-            } else {
-              spawnCombatFloaterRef.current(`-${tickDmg} HP`, "damage");
+        const shooterOk =
+          canPlayRef.current &&
+          !caughtRef.current[playerId] &&
+          !winnerIdRef.current;
+
+        if (
+          combatRoleRef.current === "dmg" &&
+          fireHeldRef.current &&
+          aimVictimPlayerIdRef.current &&
+          shooterOk
+        ) {
+          const victim = aimVictimPlayerIdRef.current;
+          const weapon = weaponTypeRef.current;
+          if (weapon === "sniper") {
+            if (now - lastSniperShotAtRef.current >= SNIPER_COOLDOWN_MS) {
+              lastSniperShotAtRef.current = now;
+              const dmg =
+                SNIPER_DMG_MIN +
+                Math.floor(
+                  Math.random() * (SNIPER_DMG_MAX - SNIPER_DMG_MIN + 1),
+                );
+              const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
+              publish({
+                type: "weapon_hit",
+                roomId: roomKey,
+                hitId,
+                shooterPlayerId: playerId,
+                victimPlayerId: victim,
+                damage: dmg,
+                weapon: "sniper",
+                ts: now,
+              });
             }
+          } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
+            lastSemiShotAtRef.current = now;
+            const dmg =
+              SEMI_DMG_MIN +
+              Math.floor(Math.random() * (SEMI_DMG_MAX - SEMI_DMG_MIN + 1));
+            const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
+            publish({
+              type: "weapon_hit",
+              roomId: roomKey,
+              hitId,
+              shooterPlayerId: playerId,
+              victimPlayerId: victim,
+              damage: dmg,
+              weapon: "semi",
+              ts: now,
+            });
           }
         }
 
@@ -736,25 +801,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
         hpRef.current = hp;
         const rounded = Math.round(hp);
         setHpDisplay((prev) => (prev !== rounded ? rounded : prev));
-
-        if (hp <= 0 && damageLocked && !zeroHpHandledRef.current) {
-          zeroHpHandledRef.current = true;
-          const catcher = lastTagLockScannerRef.current;
-          if (catcher && catcher !== playerId) {
-            publish({
-              type: "player_caught",
-              roomId: roomKey,
-              caughtPlayerId: playerId,
-              catcherPlayerId: catcher,
-              ts: now,
-            });
-            setCaught((p) => (p[playerId] ? p : { ...p, [playerId]: catcher }));
-          } else {
-            zeroHpHandledRef.current = false;
-            hpRef.current = 1;
-            setHpDisplay(1);
-          }
-        }
       }
 
       frame = requestAnimationFrame(step);
@@ -788,7 +834,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
               roomId: roomKey,
               scannerPlayerId: playerId,
               victimPlayerId: victimId,
-              critChance: dmgCritChanceRef.current,
               ts: now,
             });
           }
@@ -824,6 +869,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (tid === r.myTagId) continue;
         aim = tid;
         break;
+      }
+      {
+        const aimVictimPid =
+          role === "dmg" && aim !== null ? (r.tagToPlayer.get(aim) ?? null) : null;
+        aimVictimPlayerIdRef.current = aimVictimPid;
       }
       if (aim !== prevAimHuntTagRef.current) {
         prevAimHuntTagRef.current = aim;
@@ -933,17 +983,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
             </h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-300">
               Mit dem AprilTag wirkt du auf andere Spieler.{" "}
-              <strong className="text-zinc-100">Schaden</strong> entzieht typisch{" "}
-              <strong className="text-red-300">
-                {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s
-              </strong>{" "}
-              (schwankend), alle {DMG_TICK_MS} ms ein Tick, Crit ×2 auf den Tick. Standard-Crit{" "}
-              <strong className="text-amber-200/90">{DMG_CRIT_PCT_MIN}%</strong>, als DMG-Spieler per
-              Regler bis {DMG_CRIT_PCT_MAX}%.{" "}
+              <strong className="text-zinc-100">Schaden</strong>: Ziel im Fadenkreuz, dann{" "}
+              <strong className="text-red-300">Feuer halten</strong> –{" "}
+              <strong className="text-rose-300">Sniper</strong>{" "}
+              {SNIPER_DMG_MIN}–{SNIPER_DMG_MAX} HP alle {SNIPER_COOLDOWN_MS / 1000}s,{" "}
+              <strong className="text-rose-300">Halbautomatik</strong>{" "}
+              {SEMI_DMG_MIN}–{SEMI_DMG_MAX} HP alle {SEMI_COOLDOWN_MS} ms.{" "}
               <strong className="text-zinc-100">Heilung</strong> stellt{" "}
-              <strong className="text-emerald-300">{HEAL_PER_SEC} HP/s</strong> wieder her (halber
-              Schaden). Beides kann ein Ziel <strong className="text-zinc-100">gleichzeitig</strong>{" "}
-              treffen (ein Spieler heilt, ein anderer schadet).
+              <strong className="text-emerald-300">{HEAL_PER_SEC} HP/s</strong> wieder her. Beides
+              kann ein Ziel <strong className="text-zinc-100">gleichzeitig</strong> treffen.
             </p>
             <div className="mt-6 flex flex-col gap-2 sm:flex-row">
               <button
@@ -1066,36 +1114,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
           {tagBeamActive && (
             <p className="mt-1.5 text-center text-[11px] font-medium text-red-200/90">
-              Schaden: AprilTag im Visier – ca. {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s, Tick alle{" "}
-              {DMG_TICK_MS} ms
+              Schaden: Ziel im Visier – unten <strong className="text-rose-100">Feuer halten</strong> zum
+              Schießen
             </p>
-          )}
-          {combatRole === "dmg" && (
-            <div className="mt-2 rounded-lg border border-rose-900/50 bg-rose-950/50 px-3 py-2">
-              <label className="flex flex-col gap-1.5 text-left text-[11px] text-rose-100/95">
-                <span className="flex items-center justify-between gap-2 font-medium">
-                  <span>Crit-Chance (dein DMG)</span>
-                  <span className="tabular-nums text-rose-200">{dmgCritPercent}%</span>
-                </span>
-                <input
-                  type="range"
-                  min={DMG_CRIT_PCT_MIN}
-                  max={DMG_CRIT_PCT_MAX}
-                  step={1}
-                  value={dmgCritPercent}
-                  onChange={(e) => onDmgCritPercentChange(Number(e.target.value))}
-                  className="h-2 w-full cursor-pointer accent-rose-400"
-                  aria-valuemin={DMG_CRIT_PCT_MIN}
-                  aria-valuemax={DMG_CRIT_PCT_MAX}
-                  aria-valuenow={dmgCritPercent}
-                  aria-label="Crit-Chance für Schaden"
-                />
-                <span className="text-[10px] leading-snug text-rose-200/75">
-                  Pro {DMG_TICK_MS} ms ein Schadenstext; Crit verdoppelt den Tick. Crit-Text ist größer
-                  und leuchtet.
-                </span>
-              </label>
-            </div>
           )}
           {tagHealActive && (
             <p className="mt-1 text-center text-[11px] font-medium text-emerald-200/90">
@@ -1186,23 +1207,100 @@ export function CatchGame({ roomId }: { roomId: string }) {
                     Im Fadenkreuz ·{" "}
                     {combatRole === "heal"
                       ? `Heilung +${HEAL_PER_SEC} HP/s`
-                      : `Schaden ca. ${DMG_DPS_MIN}–${DMG_DPS_MAX} HP/s`}
+                      : weaponChoice === "sniper"
+                        ? `Sniper ${SNIPER_DMG_MIN}–${SNIPER_DMG_MAX} / ${SNIPER_COOLDOWN_MS / 1000}s`
+                        : `Halbauto ${SEMI_DMG_MIN}–${SEMI_DMG_MAX} / ${SEMI_COOLDOWN_MS}ms`}
                   </p>
                 </div>
               </div>
             )}
             {canPlayWithRole && !winnerId && roster && (
-              <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[20] rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
-                <p>
-                  Dein AprilTag: <strong>ID {roster.myTagId}</strong> · Rolle:{" "}
-                  <strong>{combatRole === "heal" ? "Heilung" : "Schaden"}</strong> – richte die
-                  Kamera auf die <strong>Tag-Nummer</strong> eines anderen Spielers.
-                </p>
-                <p className="mt-1 text-xs text-zinc-300">
-                  Jagbare Tag-IDs jetzt:{" "}
-                  <strong>{huntTagIds.length ? huntTagIds.join(", ") : "—"}</strong>
-                  {roster.sorted.length > 2 && ` · ${roster.sorted.length} Spieler im Raum`}
-                </p>
+              <div className="absolute bottom-0 left-0 right-0 z-[30] flex flex-col gap-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+                {combatRole === "dmg" && (
+                  <div className="pointer-events-auto mx-3 flex flex-col gap-2 rounded-xl border border-rose-800/70 bg-zinc-950/92 p-3 shadow-xl backdrop-blur-md">
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => pickWeapon("sniper")}
+                        className={`flex-1 rounded-lg border px-2 py-2.5 text-center text-[11px] font-semibold leading-tight transition sm:text-xs ${
+                          weaponChoice === "sniper"
+                            ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_16px_rgba(225,29,72,0.35)]"
+                            : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
+                        }`}
+                      >
+                        Sniper
+                        <span className="mt-0.5 block font-normal text-[10px] opacity-90">
+                          {SNIPER_DMG_MIN}–{SNIPER_DMG_MAX} HP · {SNIPER_COOLDOWN_MS / 1000}s
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => pickWeapon("semi")}
+                        className={`flex-1 rounded-lg border px-2 py-2.5 text-center text-[11px] font-semibold leading-tight transition sm:text-xs ${
+                          weaponChoice === "semi"
+                            ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_16px_rgba(225,29,72,0.35)]"
+                            : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
+                        }`}
+                      >
+                        Halbauto
+                        <span className="mt-0.5 block font-normal text-[10px] opacity-90">
+                          {SEMI_DMG_MIN}–{SEMI_DMG_MAX} HP · {SEMI_COOLDOWN_MS} ms
+                        </span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      className={`min-h-14 touch-manipulation select-none rounded-xl border-2 border-rose-500/80 bg-gradient-to-b from-rose-600 to-rose-800 px-4 py-3 text-lg font-black uppercase tracking-wide text-white shadow-lg transition active:scale-[0.98] sm:min-h-16 sm:text-xl ${
+                        firePressed ? "ring-2 ring-amber-300/90 ring-offset-2 ring-offset-zinc-950" : ""
+                      }`}
+                      style={{ WebkitUserSelect: "none" }}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        fireHeldRef.current = true;
+                        setFirePressed(true);
+                        try {
+                          (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
+                        } catch {
+                          /* */
+                        }
+                      }}
+                      onPointerUp={(e) => {
+                        fireHeldRef.current = false;
+                        setFirePressed(false);
+                        try {
+                          (e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
+                        } catch {
+                          /* */
+                        }
+                      }}
+                      onPointerLeave={() => {
+                        fireHeldRef.current = false;
+                        setFirePressed(false);
+                      }}
+                    >
+                      Feuer halten
+                    </button>
+                  </div>
+                )}
+                <div className="pointer-events-none mx-3 rounded-lg bg-black/70 px-3 py-2 text-sm text-white backdrop-blur">
+                  <p>
+                    Dein AprilTag: <strong>ID {roster.myTagId}</strong> · Rolle:{" "}
+                    <strong>{combatRole === "heal" ? "Heilung" : "Schaden"}</strong>
+                    {combatRole === "dmg" ? (
+                      <>
+                        {" "}
+                        – Ziel im Fadenkreuz, dann <strong>Feuer</strong> gedrückt halten.
+                      </>
+                    ) : (
+                      <> – richte die Kamera auf die Tag-Nummer eines anderen Spielers.</>
+                    )}
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-300">
+                    Jagbare Tag-IDs:{" "}
+                    <strong>{huntTagIds.length ? huntTagIds.join(", ") : "—"}</strong>
+                    {roster.sorted.length > 2 && ` · ${roster.sorted.length} Spieler im Raum`}
+                  </p>
+                </div>
               </div>
             )}
           </div>
