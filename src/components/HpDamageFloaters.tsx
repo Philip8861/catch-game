@@ -22,20 +22,24 @@ export function HpDamageFloaters({ items }: Props) {
     >
       {items.map((f, i) => {
         const jitter = ((f.id.charCodeAt(0) + i * 7) % 17) * 5 - 40;
+        const delay = Math.min(i, 10) * 0.032;
+        const animClass =
+          f.variant === "heal"
+            ? "hp-float hp-float--heal text-3xl sm:text-4xl text-emerald-300"
+            : f.variant === "crit"
+              ? "hp-float hp-float--crit text-5xl sm:text-7xl font-black tracking-tighter text-amber-100"
+              : "hp-float hp-float--dmg text-3xl sm:text-5xl text-rose-400";
         return (
           <div
             key={f.id}
-            className="absolute top-[42%]"
+            className="absolute top-[40%]"
             style={{ left: `calc(50% + ${jitter}px)` }}
           >
             <span
-              className={`hp-damage-float inline-block font-black tracking-tight ${
-                f.variant === "heal"
-                  ? "text-3xl sm:text-4xl text-emerald-400 drop-shadow-[0_2px_12px_rgba(6,95,70,0.95)]"
-                  : f.variant === "crit"
-                    ? "hp-damage-crit text-5xl sm:text-6xl text-amber-200"
-                    : "text-3xl sm:text-4xl text-red-400 drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)]"
-              }`}
+              className={`inline-block font-black tracking-tight ${animClass}`}
+              style={{
+                animationDelay: `${delay}s`,
+              }}
             >
               {f.text}
             </span>

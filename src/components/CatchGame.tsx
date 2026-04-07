@@ -47,12 +47,14 @@ const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
 const MAX_HP = 1000;
-/** Schaden pro Treffer (Basis); Crit = doppelter Abzug (25 → 50). */
-const DMG_CHUNK_HP = 25;
+/** Crit verdoppelt den Schaden des jeweiligen 250-ms-Ticks. */
 const DMG_CRIT_MULT = 2;
-/** DPS schwankt jede Sekunde im Intervall (Pool füllt Treffer à 25). */
+/** Pro Tick neu gezogene Momentan-DPS (Zielband 5–25 HP/s über mehrere Ticks). */
 const DMG_DPS_MIN = 5;
 const DMG_DPS_MAX = 25;
+const DMG_TICK_MS = 250;
+/** Max. Ticks pro Frame (Tab-Hintergrund), verhindert Einmal-Burst. */
+const DMG_TICK_CATCHUP_MAX = 12;
 const DEFAULT_CRIT_CHANCE = 0.1;
 const DMG_CRIT_PCT_MIN = 10;
 const DMG_CRIT_PCT_MAX = 100;
@@ -129,9 +131,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const lastTagLockPublishRef = useRef<Record<string, number>>({});
   const lastTagHealPublishRef = useRef<Record<string, number>>({});
   const tagHealVisualDebtRef = useRef(0);
-  const tagDamagePoolRef = useRef(0);
-  const tagDrainDpsRef = useRef(DMG_DPS_MIN);
-  const lastDpsSampleAtRef = useRef(0);
+  const lastTagDamageTickAtRef = useRef(0);
   const incomingTagCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
   const dmgCritChanceRef = useRef(DEFAULT_CRIT_CHANCE);
   const spawnCombatFloaterRef = useRef<
@@ -151,7 +151,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setHpFloaters((prev) => [...prev.slice(-24), { id, text, variant }]);
       window.setTimeout(() => {
         setHpFloaters((prev) => prev.filter((x) => x.id !== id));
-      }, 900);
+      }, 1200);
     };
   }, []);
 
@@ -503,7 +503,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagLockPublishRef.current = {};
     lastTagHealPublishRef.current = {};
     tagHealVisualDebtRef.current = 0;
-    tagDamagePoolRef.current = 0;
+    lastTagDamageTickAtRef.current = 0;
     incomingTagCritChanceRef.current = DEFAULT_CRIT_CHANCE;
     window.queueMicrotask(() => {
       setHpDisplay(MAX_HP);
@@ -675,11 +675,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
       if (prevDamageLockedRef.current !== damageLocked) {
         prevDamageLockedRef.current = damageLocked;
-        tagDamagePoolRef.current = 0;
         if (damageLocked) {
-          tagDrainDpsRef.current =
-            DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
-          lastDpsSampleAtRef.current = now;
+          lastTagDamageTickAtRef.current = now - DMG_TICK_MS;
         }
       }
       if (prevHealLockedRef.current !== healLocked) {
@@ -700,22 +697,28 @@ export function CatchGame({ roomId }: { roomId: string }) {
         let hp = hpRef.current;
 
         if (damageLocked && hp > 0) {
-          if (now - lastDpsSampleAtRef.current >= 1000) {
-            tagDrainDpsRef.current =
-              DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
-            lastDpsSampleAtRef.current = now;
-          }
-          tagDamagePoolRef.current += tagDrainDpsRef.current * dt;
           const critP = incomingTagCritChanceRef.current;
-          while (tagDamagePoolRef.current >= DMG_CHUNK_HP && hp > 0) {
-            tagDamagePoolRef.current -= DMG_CHUNK_HP;
+          let catchup = 0;
+          while (
+            now - lastTagDamageTickAtRef.current >= DMG_TICK_MS &&
+            hp > 0 &&
+            catchup < DMG_TICK_CATCHUP_MAX
+          ) {
+            catchup++;
+            lastTagDamageTickAtRef.current += DMG_TICK_MS;
+            const tickDps =
+              DMG_DPS_MIN + Math.random() * (DMG_DPS_MAX - DMG_DPS_MIN);
+            let tickDmg = Math.max(
+              1,
+              Math.round(tickDps * (DMG_TICK_MS / 1000)),
+            );
             const crit = Math.random() < critP;
-            const dmg = crit ? DMG_CHUNK_HP * DMG_CRIT_MULT : DMG_CHUNK_HP;
-            hp = Math.max(0, hp - dmg);
+            if (crit) tickDmg *= DMG_CRIT_MULT;
+            hp = Math.max(0, hp - tickDmg);
             if (crit) {
-              spawnCombatFloaterRef.current("-50 CRIT!", "crit");
+              spawnCombatFloaterRef.current(`-${tickDmg} CRIT!`, "crit");
             } else {
-              spawnCombatFloaterRef.current("-25 HP", "damage");
+              spawnCombatFloaterRef.current(`-${tickDmg} HP`, "damage");
             }
           }
         }
@@ -934,7 +937,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               <strong className="text-red-300">
                 {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s
               </strong>{" "}
-              (schwankend), Treffer 25 HP, Crit ×2 (50). Standard-Crit{" "}
+              (schwankend), alle {DMG_TICK_MS} ms ein Tick, Crit ×2 auf den Tick. Standard-Crit{" "}
               <strong className="text-amber-200/90">{DMG_CRIT_PCT_MIN}%</strong>, als DMG-Spieler per
               Regler bis {DMG_CRIT_PCT_MAX}%.{" "}
               <strong className="text-zinc-100">Heilung</strong> stellt{" "}
@@ -1063,7 +1066,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
           </div>
           {tagBeamActive && (
             <p className="mt-1.5 text-center text-[11px] font-medium text-red-200/90">
-              Schaden: AprilTag im Visier – ca. {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s, Treffer 25 / Crit 50
+              Schaden: AprilTag im Visier – ca. {DMG_DPS_MIN}–{DMG_DPS_MAX} HP/s, Tick alle{" "}
+              {DMG_TICK_MS} ms
             </p>
           )}
           {combatRole === "dmg" && (
@@ -1087,7 +1091,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
                   aria-label="Crit-Chance für Schaden"
                 />
                 <span className="text-[10px] leading-snug text-rose-200/75">
-                  Gegner erhalten pro Treffer 25 HP; bei Crit 50 HP. Crit-Text ist größer und leuchtet.
+                  Pro {DMG_TICK_MS} ms ein Schadenstext; Crit verdoppelt den Tick. Crit-Text ist größer
+                  und leuchtet.
                 </span>
               </label>
             </div>
