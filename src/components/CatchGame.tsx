@@ -92,7 +92,7 @@ function vibrateOnWeaponHit(isCrit: boolean) {
     if (isCrit) {
       v.call(navigator, [55, 40, 65]);
     } else {
-      v.call(navigator, 42);
+      v.call(navigator, [42]);
     }
   } catch {
     /* manche Browser/WebViews blocken ohne User-Gesture */
@@ -1477,10 +1477,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       : "kein Fix – siehe Hinweis oben oder „Erneut versuchen“."}
           </p>
           <p className="text-xs text-zinc-600">
-            Karte: beim ersten GPS-Fix ~<strong className="text-zinc-400">10 km</strong> um dich; Zoom
-            und Verschieben bleiben erhalten („Zu mir (10 km)“ setzt die Ansicht zurück).{" "}
-            <strong className="text-zinc-400">Spieler 1</strong> hat einen sichtbaren Kreis mit{" "}
-            <strong className="text-zinc-400">40 km</strong> Radius.
+            Karte: sichtbar und verschiebbar nur im Umkreis von{" "}
+            <strong className="text-zinc-400">35 km</strong> um{" "}
+            <strong className="text-zinc-400">Spieler 1</strong> (weniger Kacheln, schneller Laden).
+            Ohne Spieler-1-Position startet die Ansicht mit ~<strong className="text-zinc-400">10 km</strong>{" "}
+            um dich; „Zu mir (10 km)“ zentriert wieder auf dich.
           </p>
         </div>
       </div>

@@ -31,6 +31,9 @@ function latLngBoundsKm(centerLat: number, centerLng: number, radiusKm: number) 
 }
 
 const VIEW_RADIUS_KM_SELF = 10;
+/** Karte nur in diesem Radius um Spieler 1 (weniger Kacheln, schneller). */
+const PLAYER_ONE_CLIP_RADIUS_KM = 35;
+const WORLD_BOUNDS = L.latLngBounds([-85, -180], [85, 180]);
 
 function MapAccessor({ mapRef }: { mapRef: MutableRefObject<LeafletMap | null> }) {
   const map = useMap();
@@ -60,29 +63,42 @@ function StormClickLayer({
 }
 
 /**
- * Einmaliger Fit auf ~10 km um die eigene Position, sobald GPS da ist.
- * Kein wiederholtes fitBounds bei Positions-Updates – sonst würde Pinch/Zoom
- * regelmäßig zurück auf 10 km springen.
+ * Begrenzt die Karte auf PLAYER_ONE_CLIP_RADIUS_KM um Spieler 1 (maxBounds).
+ * Erster Kartenausschnitt: bevorzugt 35 km um Spieler 1, sonst 10 km um dich.
  */
-function AutoFitViewAroundSelf({
+function MapClipAndInitialFit({
+  playerOnePos,
   myPos,
 }: {
+  playerOnePos: { lat: number; lng: number } | null;
   myPos: { lat: number; lng: number } | null;
 }) {
   const map = useMap();
-  const didInitial = useRef(false);
+  const didFitP1Ref = useRef(false);
+  const didFitSelfRef = useRef(false);
 
   useEffect(() => {
-    if (!myPos) {
-      didInitial.current = false;
+    if (playerOnePos && !didFitP1Ref.current) {
+      didFitP1Ref.current = true;
+      const b = latLngBoundsKm(
+        playerOnePos.lat,
+        playerOnePos.lng,
+        PLAYER_ONE_CLIP_RADIUS_KM,
+      );
+      map.fitBounds(b, { padding: [32, 32], maxZoom: 11, animate: false });
       return;
     }
-    if (didInitial.current) return;
-
-    didInitial.current = true;
-    const bounds = latLngBoundsKm(myPos.lat, myPos.lng, VIEW_RADIUS_KM_SELF);
-    map.fitBounds(bounds, { padding: [28, 28], maxZoom: 13, animate: false });
-  }, [myPos, map]);
+    if (
+      !playerOnePos &&
+      myPos &&
+      !didFitSelfRef.current &&
+      !didFitP1Ref.current
+    ) {
+      didFitSelfRef.current = true;
+      const b = latLngBoundsKm(myPos.lat, myPos.lng, VIEW_RADIUS_KM_SELF);
+      map.fitBounds(b, { padding: [28, 28], maxZoom: 13, animate: false });
+    }
+  }, [map, playerOnePos, myPos]);
 
   return null;
 }
@@ -111,6 +127,15 @@ export function GameMapView({
     [myPos, playerOnePos],
   );
 
+  const p1ClipBounds = useMemo(() => {
+    if (!playerOnePos) return null;
+    return latLngBoundsKm(
+      playerOnePos.lat,
+      playerOnePos.lng,
+      PLAYER_ONE_CLIP_RADIUS_KM,
+    );
+  }, [playerOnePos]);
+
   const flyToMe = () => {
     if (!myPos || !mapRef.current) return;
     const bounds = latLngBoundsKm(myPos.lat, myPos.lng, VIEW_RADIUS_KM_SELF);
@@ -126,10 +151,12 @@ export function GameMapView({
         zoom={10}
         className="h-full w-full min-h-[280px] rounded-xl z-0"
         scrollWheelZoom
+        maxBounds={p1ClipBounds ?? WORLD_BOUNDS}
+        maxBoundsViscosity={p1ClipBounds ? 1 : 0}
       >
         <MapAccessor mapRef={mapRef} />
         <StormClickLayer enabled={stormMode} onPlace={onStormPlace} />
-        <AutoFitViewAroundSelf myPos={myPos} />
+        <MapClipAndInitialFit playerOnePos={playerOnePos} myPos={myPos} />
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -137,7 +164,7 @@ export function GameMapView({
         {playerOnePos && (
           <Circle
             center={[playerOnePos.lat, playerOnePos.lng]}
-            radius={40_000}
+            radius={PLAYER_ONE_CLIP_RADIUS_KM * 1000}
             pathOptions={{
               color: "#1d4ed8",
               fillColor: "#2563eb",
@@ -146,7 +173,9 @@ export function GameMapView({
               dashArray: "10 14",
             }}
           >
-            <Tooltip direction="top">Spieler 1 · 40 km Radius</Tooltip>
+            <Tooltip direction="top">
+              Spieler 1 · Spielfeld {PLAYER_ONE_CLIP_RADIUS_KM} km
+            </Tooltip>
           </Circle>
         )}
         {stormCircles.map((s) => (
