@@ -86,14 +86,10 @@ function topicForRoom(roomKey: string) {
 /** Kurzes Haptik-Feedback für das getroffene Gerät (Android u. a.; iOS Safari meist ohne API). */
 function vibrateOnWeaponHit(isCrit: boolean) {
   if (typeof navigator === "undefined") return;
-  const v = navigator.vibrate;
-  if (typeof v !== "function") return;
+  if (typeof navigator.vibrate !== "function") return;
+  const pattern: number[] = isCrit ? [55, 40, 65] : [42];
   try {
-    if (isCrit) {
-      v.call(navigator, [55, 40, 65]);
-    } else {
-      v.call(navigator, [42]);
-    }
+    navigator.vibrate(pattern);
   } catch {
     /* manche Browser/WebViews blocken ohne User-Gesture */
   }
