@@ -25,7 +25,10 @@ import {
 } from "@/lib/beamGeo";
 import { haversineMeters } from "@/lib/geo";
 import { getOrCreatePlayerId } from "@/lib/playerId";
-import { playWeaponFireSound } from "@/lib/weaponFireSfx";
+import {
+  playWeaponFireSound,
+  unlockWeaponAudioFromUserGesture,
+} from "@/lib/weaponFireSfx";
 
 const GameMapView = dynamic(
   () => import("@/components/GameMapView").then((m) => m.GameMapView),
@@ -246,6 +249,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
 
   const pickWeapon = useCallback(
     (w: WeaponType) => {
+      unlockWeaponAudioFromUserGesture();
       setWeaponChoice(w);
       try {
         sessionStorage.setItem(weaponStorageKey(roomKey), w);
@@ -1072,7 +1076,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
         if (
           combatRoleRef.current === "dmg" &&
           fireHeldRef.current &&
-          aimVictimPlayerIdRef.current &&
           shooterOk
         ) {
           const victim = aimVictimPlayerIdRef.current;
@@ -1080,11 +1083,40 @@ export function CatchGame({ roomId }: { roomId: string }) {
           if (weapon === "sniper") {
             if (now - lastSniperShotAtRef.current >= SNIPER_COOLDOWN_MS) {
               lastSniperShotAtRef.current = now;
+              if (victim) {
+                const base =
+                  SNIPER_DMG_MIN +
+                  Math.floor(
+                    Math.random() * (SNIPER_DMG_MAX - SNIPER_DMG_MIN + 1),
+                  );
+                const crit = Math.random() < dmgCritChanceRef.current;
+                const dmg = crit
+                  ? Math.round(base * WEAPON_CRIT_MULT)
+                  : base;
+                const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
+                publish({
+                  type: "weapon_hit",
+                  roomId: roomKey,
+                  hitId,
+                  shooterPlayerId: playerId,
+                  victimPlayerId: victim,
+                  damage: dmg,
+                  weapon: "sniper",
+                  isCrit: crit,
+                  ts: now,
+                });
+                vibrateOnWeaponFired("sniper", crit);
+                playWeaponFireSound("sniper", crit);
+              } else {
+                playWeaponFireSound("sniper", false);
+              }
+            }
+          } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
+            lastSemiShotAtRef.current = now;
+            if (victim) {
               const base =
-                SNIPER_DMG_MIN +
-                Math.floor(
-                  Math.random() * (SNIPER_DMG_MAX - SNIPER_DMG_MIN + 1),
-                );
+                SEMI_DMG_MIN +
+                Math.floor(Math.random() * (SEMI_DMG_MAX - SEMI_DMG_MIN + 1));
               const crit = Math.random() < dmgCritChanceRef.current;
               const dmg = crit
                 ? Math.round(base * WEAPON_CRIT_MULT)
@@ -1097,36 +1129,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 shooterPlayerId: playerId,
                 victimPlayerId: victim,
                 damage: dmg,
-                weapon: "sniper",
+                weapon: "semi",
                 isCrit: crit,
                 ts: now,
               });
-              vibrateOnWeaponFired("sniper", crit);
-              playWeaponFireSound("sniper", crit);
+              vibrateOnWeaponFired("semi", crit);
+              playWeaponFireSound("semi", crit);
+            } else {
+              playWeaponFireSound("semi", false);
             }
-          } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
-            lastSemiShotAtRef.current = now;
-            const base =
-              SEMI_DMG_MIN +
-              Math.floor(Math.random() * (SEMI_DMG_MAX - SEMI_DMG_MIN + 1));
-            const crit = Math.random() < dmgCritChanceRef.current;
-            const dmg = crit
-              ? Math.round(base * WEAPON_CRIT_MULT)
-              : base;
-            const hitId = `${playerId}-${now}-${Math.random().toString(36).slice(2, 10)}`;
-            publish({
-              type: "weapon_hit",
-              roomId: roomKey,
-              hitId,
-              shooterPlayerId: playerId,
-              victimPlayerId: victim,
-              damage: dmg,
-              weapon: "semi",
-              isCrit: crit,
-              ts: now,
-            });
-            vibrateOnWeaponFired("semi", crit);
-            playWeaponFireSound("semi", crit);
           }
         }
 
@@ -1672,6 +1683,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       }`}
                       style={{ WebkitUserSelect: "none" }}
                       onPointerDown={(e) => {
+                        unlockWeaponAudioFromUserGesture();
                         e.preventDefault();
                         fireHeldRef.current = true;
                         setFirePressed(true);

@@ -1,6 +1,7 @@
 /**
  * Kurze Waffen-Schüsse per Web Audio API (keine externen Samples, geringe Latenz).
- * Sniper: tieferer Knall, längerer Nachhall; Halbauto: knapper, heller Crack.
+ * Mobile (iOS/Android): AudioContext muss im selben Tap wie „Feuer“ entsperrt werden
+ * (siehe unlockWeaponAudioFromUserGesture); Schüsse aus requestAnimationFrame allein reichen nicht.
  */
 
 type WeaponSfx = "sniper" | "semi";
@@ -17,6 +18,33 @@ function getAudioContext(): AudioContext | null {
     sharedCtx = new Ctor();
   }
   return sharedCtx;
+}
+
+/**
+ * Muss synchron beim ersten Tap auf „Feuer halten“ (pointerdown) laufen – sonst bleibt
+ * der Context auf iOS/Safari stumm, weil Schüsse später nur aus rAF kommen.
+ */
+export function unlockWeaponAudioFromUserGesture(): void {
+  if (typeof window === "undefined") return;
+  const ctx = getAudioContext();
+  if (!ctx) return;
+
+  void ctx.resume().catch(() => {});
+
+  const t = ctx.currentTime;
+  try {
+    const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const g = ctx.createGain();
+    g.gain.value = 0.0001;
+    src.connect(g);
+    g.connect(ctx.destination);
+    src.start(t);
+    src.stop(t + 0.001);
+  } catch {
+    /* ältere WebViews */
+  }
 }
 
 function noiseBuffer(ctx: AudioContext, durationSec: number): AudioBuffer {
@@ -122,7 +150,10 @@ function playCritShine(
   o.frequency.value = weapon === "sniper" ? 990 : 1320;
   const g = ctx.createGain();
   g.gain.setValueAtTime(0.0001, t0);
-  g.gain.exponentialRampToValueAtTime(weapon === "sniper" ? 0.07 : 0.055, t0 + 0.002);
+  g.gain.exponentialRampToValueAtTime(
+    weapon === "sniper" ? 0.07 : 0.055,
+    t0 + 0.002,
+  );
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
   o.connect(g);
   g.connect(dest);
@@ -130,34 +161,36 @@ function playCritShine(
   o.stop(t0 + 0.1);
 }
 
-/**
- * Spielt einen Schuss für den lokalen Spieler (nur nach User-Gesture zuverlässig).
- */
-export function playWeaponFireSound(
-  weapon: WeaponSfx,
-  isCrit: boolean,
-): void {
-  const ctx = getAudioContext();
-  if (!ctx) return;
-  void ctx.resume().catch(() => {});
-
-  const t0 = ctx.currentTime;
-
-  const bus = ctx.createGain();
-  bus.gain.value = isCrit ? 1.12 : 1;
-
-  const pan = ctx.createStereoPanner();
-  pan.pan.value = (Math.random() - 0.5) * 0.22;
-  bus.connect(pan);
-
+function connectBusToSpeakers(ctx: AudioContext, bus: GainNode): void {
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -14;
+  comp.threshold.value = -12;
   comp.knee.value = 6;
   comp.ratio.value = 3;
   comp.attack.value = 0.002;
   comp.release.value = 0.08;
-  pan.connect(comp);
+
+  try {
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = (Math.random() - 0.5) * 0.22;
+    bus.connect(pan);
+    pan.connect(comp);
+  } catch {
+    bus.connect(comp);
+  }
   comp.connect(ctx.destination);
+}
+
+function scheduleWeaponFire(
+  ctx: AudioContext,
+  weapon: WeaponSfx,
+  isCrit: boolean,
+): void {
+  const t0 = ctx.currentTime;
+
+  const bus = ctx.createGain();
+  bus.gain.value = isCrit ? 1.18 : 1;
+
+  connectBusToSpeakers(ctx, bus);
 
   if (weapon === "sniper") {
     playNoiseCrack(ctx, t0, bus, {
@@ -206,4 +239,24 @@ export function playWeaponFireSound(
     playLowThump(ctx, t0, bus, isCrit ? 195 : 205, isCrit ? 0.2 : 0.14, 0.045);
     if (isCrit) playCritShine(ctx, t0 + 0.008, bus, "semi");
   }
+}
+
+export function playWeaponFireSound(weapon: WeaponSfx, isCrit: boolean): void {
+  const ctx = getAudioContext();
+  if (!ctx) return;
+
+  const run = () => {
+    if (ctx.state !== "running") return;
+    try {
+      scheduleWeaponFire(ctx, weapon, isCrit);
+    } catch {
+      /* z. B. fehlende Nodes in eingeschränkten WebViews */
+    }
+  };
+
+  if (ctx.state === "running") {
+    run();
+    return;
+  }
+  void ctx.resume().then(run).catch(() => {});
 }
