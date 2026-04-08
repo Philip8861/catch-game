@@ -1,262 +1,120 @@
 /**
- * Kurze Waffen-Schüsse per Web Audio API (keine externen Samples, geringe Latenz).
- * Mobile (iOS/Android): AudioContext muss im selben Tap wie „Feuer“ entsperrt werden
- * (siehe unlockWeaponAudioFromUserGesture); Schüsse aus requestAnimationFrame allein reichen nicht.
+ * Schussgeräusche per HTMLAudioElement + im Speicher erzeugtes WAV.
+ * Läuft auf iOS/Android zuverlässiger als Web Audio aus requestAnimationFrame.
+ * Mikrofon ist dafür nicht nötig – Ausgabe geht über die Medienlautstärke.
  */
 
 type WeaponSfx = "sniper" | "semi";
 
-let sharedCtx: AudioContext | null = null;
-
-function getAudioContext(): AudioContext | null {
-  if (typeof window === "undefined") return null;
-  const w = window as Window &
-    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
-  const Ctor = window.AudioContext ?? w.webkitAudioContext;
-  if (!Ctor) return null;
-  if (!sharedCtx || sharedCtx.state === "closed") {
-    sharedCtx = new Ctor();
+function writeAscii(view: DataView, offset: number, s: string) {
+  for (let i = 0; i < s.length; i++) {
+    view.setUint8(offset + i, s.charCodeAt(i));
   }
-  return sharedCtx;
+}
+
+/** 16-bit PCM mono WAV als Blob */
+function pcmWavBlob(
+  durationSec: number,
+  sampleRate: number,
+  sampleAt: (i: number, n: number) => number,
+): Blob {
+  const numSamples = Math.max(1, Math.floor(durationSec * sampleRate));
+  const dataBytes = numSamples * 2;
+  const buffer = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataBytes, true);
+  const samples = new Int16Array(buffer, 44);
+  for (let i = 0; i < numSamples; i++) {
+    const x = Math.max(-1, Math.min(1, sampleAt(i, numSamples)));
+    samples[i] = Math.round(x * 32767);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+const SAMPLE_RATE = 44100;
+
+function gunshotBlob(weapon: WeaponSfx, isCrit: boolean): Blob {
+  const duration =
+    weapon === "sniper"
+      ? isCrit
+        ? 0.2
+        : 0.16
+      : isCrit
+        ? 0.095
+        : 0.07;
+  const decayPerSample =
+    weapon === "sniper"
+      ? Math.pow(0.001, 1 / (SAMPLE_RATE * duration * 0.85))
+      : Math.pow(0.001, 1 / (SAMPLE_RATE * duration * 0.75));
+  const loudness =
+    (isCrit ? 0.94 : 0.76) * (weapon === "sniper" ? 1 : 0.92);
+
+  let env = 1;
+  let lp = 0;
+
+  return pcmWavBlob(duration, SAMPLE_RATE, () => {
+    const white = Math.random() * 2 - 1;
+    lp =
+      weapon === "sniper"
+        ? lp * 0.68 + white * 0.32
+        : lp * 0.35 + white * 0.65;
+    const out = lp * env * loudness;
+    env *= decayPerSample;
+    return out;
+  });
+}
+
+const shotUrlCache = new Map<string, string>();
+
+function shotObjectUrl(weapon: WeaponSfx, isCrit: boolean): string {
+  const key = `${weapon}:${isCrit}`;
+  let url = shotUrlCache.get(key);
+  if (!url) {
+    url = URL.createObjectURL(gunshotBlob(weapon, isCrit));
+    shotUrlCache.set(key, url);
+  }
+  return url;
+}
+
+let silentObjectUrl: string | null = null;
+
+function silentObjectUrlOnce(): string {
+  if (!silentObjectUrl) {
+    silentObjectUrl = URL.createObjectURL(
+      pcmWavBlob(0.03, SAMPLE_RATE, () => 0),
+    );
+  }
+  return silentObjectUrl;
 }
 
 /**
- * Muss synchron beim ersten Tap auf „Feuer halten“ (pointerdown) laufen – sonst bleibt
- * der Context auf iOS/Safari stumm, weil Schüsse später nur aus rAF kommen.
+ * Einmalig beim Tap (Feuer / Waffenwahl) – entsperrt Audio auf iOS für dieselbe Seite.
  */
 export function unlockWeaponAudioFromUserGesture(): void {
   if (typeof window === "undefined") return;
-  const ctx = getAudioContext();
-  if (!ctx) return;
-
-  void ctx.resume().catch(() => {});
-
-  const t = ctx.currentTime;
-  try {
-    const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    const g = ctx.createGain();
-    g.gain.value = 0.0001;
-    src.connect(g);
-    g.connect(ctx.destination);
-    src.start(t);
-    src.stop(t + 0.001);
-  } catch {
-    /* ältere WebViews */
-  }
+  const a = new Audio(silentObjectUrlOnce());
+  a.volume = 0.0001;
+  void a.play().catch(() => {});
 }
 
-function noiseBuffer(ctx: AudioContext, durationSec: number): AudioBuffer {
-  const n = Math.max(1, Math.ceil(ctx.sampleRate * durationSec));
-  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < n; i++) {
-    d[i] = Math.random() * 2 - 1;
-  }
-  return buf;
-}
-
-function connectToDestination(
-  ctx: AudioContext,
-  t0: number,
-  node: AudioNode,
-  peak: number,
-  attackSec: number,
-  holdSec: number,
-  decaySec: number,
-  dest: AudioNode,
-): void {
-  const g = ctx.createGain();
-  const end = t0 + attackSec + holdSec + decaySec;
-  g.gain.setValueAtTime(0.0001, t0);
-  g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.02), t0 + attackSec);
-  g.gain.setValueAtTime(Math.max(peak * 0.85, 0.02), t0 + attackSec + holdSec);
-  g.gain.exponentialRampToValueAtTime(0.0001, end);
-  node.connect(g);
-  g.connect(dest);
-}
-
-function playNoiseCrack(
-  ctx: AudioContext,
-  t0: number,
-  dest: AudioNode,
-  opts: {
-    duration: number;
-    highPassHz: number;
-    bandHz: number;
-    bandQ: number;
-    peak: number;
-    attackMs: number;
-    holdMs: number;
-    decayMs: number;
-  },
-): void {
-  const src = ctx.createBufferSource();
-  src.buffer = noiseBuffer(ctx, opts.duration);
-  const hp = ctx.createBiquadFilter();
-  hp.type = "highpass";
-  hp.frequency.value = opts.highPassHz;
-  const bp = ctx.createBiquadFilter();
-  bp.type = "bandpass";
-  bp.frequency.value = opts.bandHz;
-  bp.Q.value = opts.bandQ;
-  src.connect(hp);
-  hp.connect(bp);
-  connectToDestination(
-    ctx,
-    t0,
-    bp,
-    opts.peak,
-    opts.attackMs / 1000,
-    opts.holdMs / 1000,
-    opts.decayMs / 1000,
-    dest,
-  );
-  src.start(t0);
-  src.stop(t0 + opts.duration + 0.02);
-}
-
-function playLowThump(
-  ctx: AudioContext,
-  t0: number,
-  dest: AudioNode,
-  freqHz: number,
-  peak: number,
-  durSec: number,
-): void {
-  const o = ctx.createOscillator();
-  o.type = "sine";
-  o.frequency.setValueAtTime(freqHz, t0);
-  o.frequency.exponentialRampToValueAtTime(freqHz * 0.55, t0 + durSec * 0.7);
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0.0001, t0);
-  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.004);
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + durSec);
-  o.connect(g);
-  g.connect(dest);
-  o.start(t0);
-  o.stop(t0 + durSec + 0.03);
-}
-
-function playCritShine(
-  ctx: AudioContext,
-  t0: number,
-  dest: AudioNode,
-  weapon: WeaponSfx,
-): void {
-  const o = ctx.createOscillator();
-  o.type = "sine";
-  o.frequency.value = weapon === "sniper" ? 990 : 1320;
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0.0001, t0);
-  g.gain.exponentialRampToValueAtTime(
-    weapon === "sniper" ? 0.07 : 0.055,
-    t0 + 0.002,
-  );
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
-  o.connect(g);
-  g.connect(dest);
-  o.start(t0);
-  o.stop(t0 + 0.1);
-}
-
-function connectBusToSpeakers(ctx: AudioContext, bus: GainNode): void {
-  const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -12;
-  comp.knee.value = 6;
-  comp.ratio.value = 3;
-  comp.attack.value = 0.002;
-  comp.release.value = 0.08;
-
-  try {
-    const pan = ctx.createStereoPanner();
-    pan.pan.value = (Math.random() - 0.5) * 0.22;
-    bus.connect(pan);
-    pan.connect(comp);
-  } catch {
-    bus.connect(comp);
-  }
-  comp.connect(ctx.destination);
-}
-
-function scheduleWeaponFire(
-  ctx: AudioContext,
-  weapon: WeaponSfx,
-  isCrit: boolean,
-): void {
-  const t0 = ctx.currentTime;
-
-  const bus = ctx.createGain();
-  bus.gain.value = isCrit ? 1.18 : 1;
-
-  connectBusToSpeakers(ctx, bus);
-
-  if (weapon === "sniper") {
-    playNoiseCrack(ctx, t0, bus, {
-      duration: 0.16,
-      highPassHz: 450,
-      bandHz: 2400,
-      bandQ: 3.2,
-      peak: isCrit ? 0.95 : 0.78,
-      attackMs: 0.35,
-      holdMs: 6,
-      decayMs: isCrit ? 155 : 125,
-    });
-    playNoiseCrack(ctx, t0 + 0.0008, bus, {
-      duration: 0.1,
-      highPassHz: 1200,
-      bandHz: 6200,
-      bandQ: 4,
-      peak: isCrit ? 0.22 : 0.16,
-      attackMs: 0.2,
-      holdMs: 2,
-      decayMs: 28,
-    });
-    playLowThump(ctx, t0, bus, isCrit ? 118 : 108, isCrit ? 0.42 : 0.34, 0.1);
-    if (isCrit) playCritShine(ctx, t0 + 0.012, bus, "sniper");
-  } else {
-    playNoiseCrack(ctx, t0, bus, {
-      duration: 0.07,
-      highPassHz: 900,
-      bandHz: 4800,
-      bandQ: 2.8,
-      peak: isCrit ? 0.82 : 0.68,
-      attackMs: 0.25,
-      holdMs: 3,
-      decayMs: isCrit ? 48 : 38,
-    });
-    playNoiseCrack(ctx, t0 + 0.0005, bus, {
-      duration: 0.045,
-      highPassHz: 2000,
-      bandHz: 7800,
-      bandQ: 3.5,
-      peak: isCrit ? 0.2 : 0.14,
-      attackMs: 0.15,
-      holdMs: 1,
-      decayMs: 22,
-    });
-    playLowThump(ctx, t0, bus, isCrit ? 195 : 205, isCrit ? 0.2 : 0.14, 0.045);
-    if (isCrit) playCritShine(ctx, t0 + 0.008, bus, "semi");
-  }
-}
-
+/**
+ * Spielt einen Schuss (laut, Medienlautstärke des Handys).
+ */
 export function playWeaponFireSound(weapon: WeaponSfx, isCrit: boolean): void {
-  const ctx = getAudioContext();
-  if (!ctx) return;
-
-  const run = () => {
-    if (ctx.state !== "running") return;
-    try {
-      scheduleWeaponFire(ctx, weapon, isCrit);
-    } catch {
-      /* z. B. fehlende Nodes in eingeschränkten WebViews */
-    }
-  };
-
-  if (ctx.state === "running") {
-    run();
-    return;
-  }
-  void ctx.resume().then(run).catch(() => {});
+  if (typeof window === "undefined") return;
+  const a = new Audio(shotObjectUrl(weapon, isCrit));
+  a.volume = 1;
+  void a.play().catch(() => {});
 }

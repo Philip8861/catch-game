@@ -1072,18 +1072,21 @@ export function CatchGame({ roomId }: { roomId: string }) {
           canPlayRef.current &&
           !caughtRef.current[playerId] &&
           !winnerIdRef.current;
+        /** Sound auch ohne zweiten Spieler / canPlay – nur Treffer brauchen shooterOk */
+        const weaponSoundOk =
+          !caughtRef.current[playerId] && !winnerIdRef.current;
 
         if (
           combatRoleRef.current === "dmg" &&
           fireHeldRef.current &&
-          shooterOk
+          weaponSoundOk
         ) {
           const victim = aimVictimPlayerIdRef.current;
           const weapon = weaponTypeRef.current;
           if (weapon === "sniper") {
             if (now - lastSniperShotAtRef.current >= SNIPER_COOLDOWN_MS) {
               lastSniperShotAtRef.current = now;
-              if (victim) {
+              if (victim && shooterOk) {
                 const base =
                   SNIPER_DMG_MIN +
                   Math.floor(
@@ -1113,7 +1116,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
             }
           } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
             lastSemiShotAtRef.current = now;
-            if (victim) {
+            if (victim && shooterOk) {
               const base =
                 SEMI_DMG_MIN +
                 Math.floor(Math.random() * (SEMI_DMG_MAX - SEMI_DMG_MIN + 1));
