@@ -73,6 +73,18 @@ export type GameMessage =
       healerPlayerId: string;
       victimPlayerId: string;
       ts: number;
+    }
+  | {
+      type: "shared_beam";
+      roomId: string;
+      beamId: string;
+      casterPlayerId: string;
+      originLat: number;
+      originLng: number;
+      endLat: number;
+      endLng: number;
+      lengthM: number;
+      ts: number;
     };
 
 export function parseGameMessage(raw: string): GameMessage | null {

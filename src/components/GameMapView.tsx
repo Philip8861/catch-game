@@ -6,6 +6,7 @@ import {
   Circle,
   CircleMarker,
   MapContainer,
+  Polyline,
   TileLayer,
   Tooltip,
   useMap,
@@ -18,6 +19,13 @@ import "leaflet/dist/leaflet.css";
 type PlayerPos = { playerId: string; lat: number; lng: number };
 
 export type StormCircle = { id: string; lat: number; lng: number; radiusM: number };
+
+export type SharedBeamLine = {
+  id: string;
+  casterId: string;
+  positions: [number, number][];
+  ts: number;
+};
 
 /** Rechteckige Bounds ~ radiusKm vom Zentrum (für fitBounds / „Kamerahöhe“) */
 function latLngBoundsKm(centerLat: number, centerLng: number, radiusKm: number) {
@@ -111,6 +119,7 @@ export function GameMapView({
   stormMode,
   onStormPlace,
   stormCircles,
+  sharedBeams,
 }: {
   myPlayerId: string;
   myPos: { lat: number; lng: number } | null;
@@ -119,6 +128,7 @@ export function GameMapView({
   stormMode: boolean;
   onStormPlace: (lat: number, lng: number) => void;
   stormCircles: StormCircle[];
+  sharedBeams: SharedBeamLine[];
 }) {
   const mapRef = useRef<LeafletMap | null>(null);
 
@@ -178,6 +188,23 @@ export function GameMapView({
             </Tooltip>
           </Circle>
         )}
+        {sharedBeams.map((b) => (
+          <Polyline
+            key={b.id}
+            positions={b.positions}
+            pathOptions={{
+              color: "#dc2626",
+              weight: 4,
+              opacity: 0.88,
+              lineCap: "round",
+              lineJoin: "round",
+            }}
+          >
+            <Tooltip direction="top" sticky>
+              Roter Strahl · Mitspieler
+            </Tooltip>
+          </Polyline>
+        ))}
         {stormCircles.map((s) => (
           <Circle
             key={s.id}

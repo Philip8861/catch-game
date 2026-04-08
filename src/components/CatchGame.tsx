@@ -12,11 +12,16 @@ import {
 } from "react";
 import Webcam from "react-webcam";
 import { useAprilTagDetector } from "@/components/AprilTagDetector";
+import { CameraLaserOverlay } from "@/components/CameraLaserOverlay";
 import { DroneJamOverlay } from "@/components/DroneJamOverlay";
 import { HpDamageFloaters } from "@/components/HpDamageFloaters";
-import type { StormCircle } from "@/components/GameMapView";
+import type { SharedBeamLine, StormCircle } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
+import {
+  compassHeadingFromEvent,
+  destinationLatLng,
+} from "@/lib/beamGeo";
 import { haversineMeters } from "@/lib/geo";
 import { getOrCreatePlayerId } from "@/lib/playerId";
 
@@ -62,6 +67,10 @@ const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
 const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
+/** Virtueller roter Strahl: Länge in Metern (horizontal zur Kompassrichtung). */
+const BEAM_LENGTH_M = 420;
+const BEAM_TTL_MS = 90_000;
+const BEAM_COOLDOWN_MS = 2800;
 
 function combatRoleStorageKey(roomKey: string) {
   return `catch-game-combat-role:${roomKey}`;
@@ -148,6 +157,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [weaponChoice, setWeaponChoice] = useState<WeaponType>("sniper");
   const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
   const [firePressed, setFirePressed] = useState(false);
+  const [sharedBeams, setSharedBeams] = useState<SharedBeamLine[]>([]);
+  const [localLaserFlash, setLocalLaserFlash] = useState(false);
+  const [laserFlashBeta, setLaserFlashBeta] = useState<number | null>(null);
+  const [beamCooldownActive, setBeamCooldownActive] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -168,6 +181,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const lastTagHealPublishRef = useRef<Record<string, number>>({});
   const tagHealVisualDebtRef = useRef(0);
   const processedWeaponHitIdsRef = useRef<string[]>([]);
+  const processedSharedBeamIdsRef = useRef<string[]>([]);
+  const orientationHeadingRef = useRef<number | null>(null);
+  const orientationBetaRef = useRef<number | null>(null);
+  const beamCooldownUntilRef = useRef(0);
   const fireHeldRef = useRef(false);
   const aimVictimPlayerIdRef = useRef<string | null>(null);
   const weaponTypeRef = useRef<WeaponType>("sniper");
@@ -308,6 +325,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
   useEffect(() => {
     const id = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const onOri = (ev: DeviceOrientationEvent) => {
+      const h = compassHeadingFromEvent(ev);
+      if (h !== null) orientationHeadingRef.current = h;
+      if (typeof ev.beta === "number" && Number.isFinite(ev.beta)) {
+        orientationBetaRef.current = ev.beta;
+      }
+    };
+    window.addEventListener("deviceorientation", onOri, true);
+    return () => window.removeEventListener("deviceorientation", onOri, true);
   }, []);
 
   const activePlayers = useMemo(() => {
@@ -558,6 +587,38 @@ export function CatchGame({ roomId }: { roomId: string }) {
           }
         }
       }
+      if (msg.type === "shared_beam") {
+        if (msg.roomId !== roomKey) return;
+        const seen = processedSharedBeamIdsRef.current;
+        if (seen.includes(msg.beamId)) return;
+        seen.push(msg.beamId);
+        if (seen.length > 160) seen.splice(0, 80);
+        const oLat = msg.originLat;
+        const oLng = msg.originLng;
+        const eLat = msg.endLat;
+        const eLng = msg.endLng;
+        if (
+          [oLat, oLng, eLat, eLng].some(
+            (x) => typeof x !== "number" || !Number.isFinite(x),
+          )
+        ) {
+          return;
+        }
+        setSharedBeams((prev) =>
+          [
+            ...prev.filter((x) => x.id !== msg.beamId),
+            {
+              id: msg.beamId,
+              casterId: msg.casterPlayerId,
+              positions: [
+                [oLat, oLng],
+                [eLat, eLng],
+              ] as [number, number][],
+              ts: msg.ts,
+            },
+          ].slice(-36),
+        );
+      }
       if (msg.type === "tag_heal") {
         if (msg.victimPlayerId !== playerId) return;
         const t = Date.now();
@@ -570,6 +631,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
       clientRef.current = null;
     };
   }, [playerId, roomKey, publish]);
+
+  const visibleSharedBeams = useMemo(
+    () => sharedBeams.filter((b) => nowTick - b.ts < BEAM_TTL_MS),
+    [sharedBeams, nowTick],
+  );
 
   const canPlay = activePlayers.length >= 2 && !winnerId;
   const canPlayWithRole = canPlay && combatRole !== null;
@@ -613,6 +679,66 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const jamActive = jamEndsAt > nowTick;
   const jamSecondsLeft = jamActive ? Math.max(0, Math.ceil((jamEndsAt - nowTick) / 1000)) : 0;
 
+  const placeSharedBeam = useCallback(async () => {
+    if (!roster || winnerId || caught[playerId] || !canPlay) {
+      setScanDebug("Strahl: nur mit aktivem Raum / Spiel");
+      return;
+    }
+    if (!myPos) {
+      setScanDebug("Strahl: GPS nötig (Standort aktivieren)");
+      return;
+    }
+    if (Date.now() < beamCooldownUntilRef.current) return;
+    try {
+      const DOE = DeviceOrientationEvent as unknown as {
+        requestPermission?: () => Promise<PermissionState>;
+      };
+      if (typeof DOE.requestPermission === "function") {
+        const p = await DOE.requestPermission();
+        if (p !== "granted") {
+          setScanDebug("Strahl: „Bewegung & Ausrichtung“ erlauben (iOS)");
+          return;
+        }
+      }
+    } catch {
+      setScanDebug("Strahl: Sensoren nicht verfügbar");
+      return;
+    }
+    const heading = orientationHeadingRef.current;
+    if (heading === null || !Number.isFinite(heading)) {
+      setScanDebug("Strahl: Kompass kalibrieren / Handy kurz drehen");
+      return;
+    }
+    const end = destinationLatLng(myPos.lat, myPos.lng, heading, BEAM_LENGTH_M);
+    const ts = Date.now();
+    const beamId = `${playerId}-${ts}`;
+    beamCooldownUntilRef.current = ts + BEAM_COOLDOWN_MS;
+    setBeamCooldownActive(true);
+    window.setTimeout(() => {
+      beamCooldownUntilRef.current = 0;
+      setBeamCooldownActive(false);
+    }, BEAM_COOLDOWN_MS);
+    publish({
+      type: "shared_beam",
+      roomId: roomKey,
+      beamId,
+      casterPlayerId: playerId,
+      originLat: myPos.lat,
+      originLng: myPos.lng,
+      endLat: end.lat,
+      endLng: end.lng,
+      lengthM: BEAM_LENGTH_M,
+      ts,
+    });
+    setLaserFlashBeta(orientationBetaRef.current);
+    setLocalLaserFlash(true);
+    window.setTimeout(() => {
+      setLocalLaserFlash(false);
+      setLaserFlashBeta(null);
+    }, 1150);
+    setScanDebug("Roter Strahl geteilt – alle sehen ihn auf der Karte");
+  }, [roster, winnerId, caught, playerId, canPlay, myPos, roomKey, publish]);
+
   const huntTagIds = useMemo(() => {
     if (!roster) return [];
     return roster.sorted
@@ -632,6 +758,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagHealPublishRef.current = {};
     tagHealVisualDebtRef.current = 0;
     processedWeaponHitIdsRef.current = [];
+    processedSharedBeamIdsRef.current = [];
     fireHeldRef.current = false;
     aimVictimPlayerIdRef.current = null;
     window.queueMicrotask(() => setFirePressed(false));
@@ -639,6 +766,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setHpDisplay(MAX_HP);
       setHpFloaters([]);
       setAimHuntTagId(null);
+      setSharedBeams([]);
+      beamCooldownUntilRef.current = 0;
+      setBeamCooldownActive(false);
       prevAimHuntTagRef.current = null;
     });
   }, [roster]);
@@ -1311,6 +1441,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 </>
               )}
             </div>
+            <CameraLaserOverlay active={localLaserFlash} betaDeg={laserFlashBeta} />
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
             {aimHuntTagId !== null && canPlayWithRole && !winnerId && roster && combatRole && (
               <div className="pointer-events-none absolute left-1/2 top-1/2 z-[32] -translate-x-1/2 -translate-y-[120%]">
@@ -1354,6 +1485,23 @@ export function CatchGame({ roomId }: { roomId: string }) {
             )}
             {canPlayWithRole && !winnerId && roster && (
               <div className="absolute bottom-0 left-0 right-0 z-[30] flex flex-col gap-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+                {locationConsent === true && gpsOk && myPos && (
+                  <div className="pointer-events-auto mx-3 rounded-xl border border-red-900/50 bg-zinc-950/90 p-2.5 shadow-lg backdrop-blur-md">
+                    <button
+                      type="button"
+                      onClick={() => void placeSharedBeam()}
+                      disabled={beamCooldownActive}
+                      className="w-full rounded-lg bg-gradient-to-b from-red-700 to-red-900 py-2.5 text-sm font-bold text-white shadow-md transition enabled:active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      Roter Strahl teilen
+                    </button>
+                    <p className="mt-1.5 text-center text-[10px] leading-snug text-zinc-400">
+                      Fadenkreuz = Blickachse · GPS + Kompass ·{" "}
+                      <strong className="text-zinc-300">{BEAM_LENGTH_M} m</strong> auf der{" "}
+                      <strong className="text-zinc-300">Karte</strong> für alle im Raum
+                    </p>
+                  </div>
+                )}
                 {combatRole === "dmg" && (
                   <div className="pointer-events-auto mx-3 flex flex-col gap-2 rounded-xl border border-rose-800/70 bg-zinc-950/92 p-3 shadow-xl backdrop-blur-md">
                     <div className="flex gap-2">
@@ -1475,6 +1623,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               stormMode={stormMode}
               onStormPlace={handleStormPlace}
               stormCircles={stormCircles}
+              sharedBeams={visibleSharedBeams}
             />
           </div>
           <p className="text-xs text-zinc-500">
@@ -1496,7 +1645,9 @@ export function CatchGame({ roomId }: { roomId: string }) {
             <strong className="text-zinc-400">35 km</strong> um{" "}
             <strong className="text-zinc-400">Spieler 1</strong> (weniger Kacheln, schneller Laden).
             Ohne Spieler-1-Position startet die Ansicht mit ~<strong className="text-zinc-400">10 km</strong>{" "}
-            um dich; „Zu mir (10 km)“ zentriert wieder auf dich.
+            um dich; „Zu mir (10 km)“ zentriert wieder auf dich.{" "}
+            <strong className="text-zinc-400">Roter Strahl:</strong> in der Kamera platzieren, Linie für
+            alle ~{Math.round(BEAM_TTL_MS / 1000)} s.
           </p>
         </div>
       </div>
