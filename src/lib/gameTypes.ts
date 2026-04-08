@@ -75,15 +75,19 @@ export type GameMessage =
       ts: number;
     }
   | {
-      type: "shared_beam";
+      type: "super_beam";
       roomId: string;
-      beamId: string;
+      superBeamId: string;
       casterPlayerId: string;
       originLat: number;
       originLng: number;
       endLat: number;
       endLng: number;
       lengthM: number;
+      halfWidthM: number;
+      hitPlayerIds: string[];
+      /** Zeitpunkt (ms), zu dem der Schaden ausgeführt wird (Absender-Uhr). */
+      impactAt: number;
       ts: number;
     };
 

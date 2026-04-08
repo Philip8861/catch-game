@@ -6,7 +6,7 @@ import {
   Circle,
   CircleMarker,
   MapContainer,
-  Polyline,
+  Polygon,
   TileLayer,
   Tooltip,
   useMap,
@@ -20,10 +20,11 @@ type PlayerPos = { playerId: string; lat: number; lng: number };
 
 export type StormCircle = { id: string; lat: number; lng: number; radiusM: number };
 
-export type SharedBeamLine = {
+/** Superstrahl: kurzer breiter Korridor (nur Polygon, eigene Farbe). */
+export type SuperBeamLine = {
   id: string;
   casterId: string;
-  positions: [number, number][];
+  corridor: [number, number][];
   ts: number;
 };
 
@@ -119,7 +120,7 @@ export function GameMapView({
   stormMode,
   onStormPlace,
   stormCircles,
-  sharedBeams,
+  superBeams,
 }: {
   myPlayerId: string;
   myPos: { lat: number; lng: number } | null;
@@ -128,7 +129,7 @@ export function GameMapView({
   stormMode: boolean;
   onStormPlace: (lat: number, lng: number) => void;
   stormCircles: StormCircle[];
-  sharedBeams: SharedBeamLine[];
+  superBeams: SuperBeamLine[];
 }) {
   const mapRef = useRef<LeafletMap | null>(null);
 
@@ -188,22 +189,22 @@ export function GameMapView({
             </Tooltip>
           </Circle>
         )}
-        {sharedBeams.map((b) => (
-          <Polyline
+        {superBeams.map((b) => (
+          <Polygon
             key={b.id}
-            positions={b.positions}
+            positions={b.corridor}
             pathOptions={{
-              color: "#dc2626",
-              weight: 4,
-              opacity: 0.88,
-              lineCap: "round",
-              lineJoin: "round",
+              color: "#c2410c",
+              fillColor: "#f97316",
+              fillOpacity: 0.45,
+              weight: 3,
+              opacity: 0.98,
             }}
           >
             <Tooltip direction="top" sticky>
-              Roter Strahl · Mitspieler
+              Superstrahl · Sturm-Warnung
             </Tooltip>
-          </Polyline>
+          </Polygon>
         ))}
         {stormCircles.map((s) => (
           <Circle

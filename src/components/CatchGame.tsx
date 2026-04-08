@@ -12,18 +12,20 @@ import {
 } from "react";
 import Webcam from "react-webcam";
 import { useAprilTagDetector } from "@/components/AprilTagDetector";
-import { CameraLaserOverlay } from "@/components/CameraLaserOverlay";
 import { DroneJamOverlay } from "@/components/DroneJamOverlay";
 import { HpDamageFloaters } from "@/components/HpDamageFloaters";
-import type { SharedBeamLine, StormCircle } from "@/components/GameMapView";
+import type { StormCircle, SuperBeamLine } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
 import {
+  beamGroundCorridor,
   compassHeadingFromEvent,
   destinationLatLng,
+  isPointInBeamCorridor,
 } from "@/lib/beamGeo";
 import { haversineMeters } from "@/lib/geo";
 import { getOrCreatePlayerId } from "@/lib/playerId";
+import { playWeaponFireSound } from "@/lib/weaponFireSfx";
 
 const GameMapView = dynamic(
   () => import("@/components/GameMapView").then((m) => m.GameMapView),
@@ -67,10 +69,14 @@ const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
 const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
-/** Virtueller roter Strahl: Länge in Metern (horizontal zur Kompassrichtung). */
-const BEAM_LENGTH_M = 420;
-const BEAM_TTL_MS = 90_000;
-const BEAM_COOLDOWN_MS = 2800;
+/** Superstrahl: 20 m Länge, 10 m Gesamtbreite (halbe Breite 5 m). */
+const SUPER_BEAM_LENGTH_M = 20;
+const SUPER_BEAM_HALF_WIDTH_M = 5;
+const SUPER_BEAM_COUNTDOWN_MS = 3000;
+const SUPER_BEAM_COOLDOWN_MS = 42_000;
+const SUPER_BEAM_MAP_TTL_MS = 90_000;
+const SUPER_BEAM_WARNING_LINES =
+  "WARNING, WARNING WARNING STORM IS COMING" as const;
 
 function combatRoleStorageKey(roomKey: string) {
   return `catch-game-combat-role:${roomKey}`;
@@ -157,10 +163,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [weaponChoice, setWeaponChoice] = useState<WeaponType>("sniper");
   const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
   const [firePressed, setFirePressed] = useState(false);
-  const [sharedBeams, setSharedBeams] = useState<SharedBeamLine[]>([]);
-  const [localLaserFlash, setLocalLaserFlash] = useState(false);
-  const [laserFlashBeta, setLaserFlashBeta] = useState<number | null>(null);
-  const [beamCooldownActive, setBeamCooldownActive] = useState(false);
+  const [superBeams, setSuperBeams] = useState<SuperBeamLine[]>([]);
+  const [superBeamCooldownActive, setSuperBeamCooldownActive] = useState(false);
+  const [superBeamWarnings, setSuperBeamWarnings] = useState<
+    Array<{ id: string; impactAt: number }>
+  >([]);
 
   const webcamRef = useRef<Webcam>(null);
   const clientRef = useRef<MqttClient | null>(null);
@@ -181,10 +188,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const lastTagHealPublishRef = useRef<Record<string, number>>({});
   const tagHealVisualDebtRef = useRef(0);
   const processedWeaponHitIdsRef = useRef<string[]>([]);
-  const processedSharedBeamIdsRef = useRef<string[]>([]);
+  const processedSuperBeamMapIdsRef = useRef<string[]>([]);
+  const processedSuperBeamDamageIdsRef = useRef<string[]>([]);
+  const superBeamCooldownUntilRef = useRef(0);
   const orientationHeadingRef = useRef<number | null>(null);
-  const orientationBetaRef = useRef<number | null>(null);
-  const beamCooldownUntilRef = useRef(0);
   const fireHeldRef = useRef(false);
   const aimVictimPlayerIdRef = useRef<string | null>(null);
   const weaponTypeRef = useRef<WeaponType>("sniper");
@@ -331,9 +338,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
     const onOri = (ev: DeviceOrientationEvent) => {
       const h = compassHeadingFromEvent(ev);
       if (h !== null) orientationHeadingRef.current = h;
-      if (typeof ev.beta === "number" && Number.isFinite(ev.beta)) {
-        orientationBetaRef.current = ev.beta;
-      }
     };
     window.addEventListener("deviceorientation", onOri, true);
     return () => window.removeEventListener("deviceorientation", onOri, true);
@@ -587,37 +591,89 @@ export function CatchGame({ roomId }: { roomId: string }) {
           }
         }
       }
-      if (msg.type === "shared_beam") {
+      if (msg.type === "super_beam") {
         if (msg.roomId !== roomKey) return;
-        const seen = processedSharedBeamIdsRef.current;
-        if (seen.includes(msg.beamId)) return;
-        seen.push(msg.beamId);
-        if (seen.length > 160) seen.splice(0, 80);
         const oLat = msg.originLat;
         const oLng = msg.originLng;
         const eLat = msg.endLat;
         const eLng = msg.endLng;
+        const hw = msg.halfWidthM;
         if (
-          [oLat, oLng, eLat, eLng].some(
+          [oLat, oLng, eLat, eLng, hw].some(
             (x) => typeof x !== "number" || !Number.isFinite(x),
-          )
+          ) ||
+          hw <= 0
         ) {
           return;
         }
-        setSharedBeams((prev) =>
-          [
-            ...prev.filter((x) => x.id !== msg.beamId),
-            {
-              id: msg.beamId,
-              casterId: msg.casterPlayerId,
-              positions: [
-                [oLat, oLng],
-                [eLat, eLng],
-              ] as [number, number][],
-              ts: msg.ts,
-            },
-          ].slice(-36),
-        );
+        const mapSeen = processedSuperBeamMapIdsRef.current;
+        if (!mapSeen.includes(msg.superBeamId)) {
+          mapSeen.push(msg.superBeamId);
+          if (mapSeen.length > 120) mapSeen.splice(0, 60);
+          const corridor = beamGroundCorridor(oLat, oLng, eLat, eLng, hw);
+          setSuperBeams((prev) =>
+            [
+              ...prev.filter((x) => x.id !== msg.superBeamId),
+              {
+                id: msg.superBeamId,
+                casterId: msg.casterPlayerId,
+                corridor,
+                ts: msg.ts,
+              },
+            ].slice(-24),
+          );
+        }
+        if (
+          msg.hitPlayerIds.includes(playerId) &&
+          !zeroHpHandledRef.current &&
+          typeof msg.impactAt === "number" &&
+          Number.isFinite(msg.impactAt)
+        ) {
+          setSuperBeamWarnings((prev) =>
+            prev.some((w) => w.id === msg.superBeamId)
+              ? prev
+              : [...prev, { id: msg.superBeamId, impactAt: msg.impactAt }],
+          );
+          const delay = Math.max(0, msg.impactAt - Date.now());
+          const superBeamId = msg.superBeamId;
+          const casterPlayerId = msg.casterPlayerId;
+          window.setTimeout(() => {
+            const dmgSeen = processedSuperBeamDamageIdsRef.current;
+            if (dmgSeen.includes(superBeamId)) return;
+            if (zeroHpHandledRef.current) return;
+            dmgSeen.push(superBeamId);
+            if (dmgSeen.length > 120) dmgSeen.splice(0, 60);
+            const nextHp = Math.max(0, hpRef.current - STORM_HP_DAMAGE);
+            hpRef.current = nextHp;
+            window.queueMicrotask(() => {
+              setHpDisplay(Math.round(nextHp));
+            });
+            const pops = STORM_HP_DAMAGE / 50;
+            for (let i = 0; i < pops; i++) {
+              window.setTimeout(() => {
+                spawnCombatFloaterRef.current("-50 HP", "damage");
+              }, i * 55);
+            }
+            vibrateOnWeaponHit(false);
+            if (nextHp <= 0 && !zeroHpHandledRef.current) {
+              zeroHpHandledRef.current = true;
+              const ts = Date.now();
+              publish({
+                type: "player_caught",
+                roomId: roomKey,
+                caughtPlayerId: playerId,
+                catcherPlayerId: casterPlayerId,
+                ts,
+              });
+              setCaught((p) =>
+                p[playerId] ? p : { ...p, [playerId]: casterPlayerId },
+              );
+            }
+            setSuperBeamWarnings((prev) =>
+              prev.filter((w) => w.id !== superBeamId),
+            );
+          }, delay);
+        }
       }
       if (msg.type === "tag_heal") {
         if (msg.victimPlayerId !== playerId) return;
@@ -632,10 +688,16 @@ export function CatchGame({ roomId }: { roomId: string }) {
     };
   }, [playerId, roomKey, publish]);
 
-  const visibleSharedBeams = useMemo(
-    () => sharedBeams.filter((b) => nowTick - b.ts < BEAM_TTL_MS),
-    [sharedBeams, nowTick],
+  const visibleSuperBeams = useMemo(
+    () => superBeams.filter((b) => nowTick - b.ts < SUPER_BEAM_MAP_TTL_MS),
+    [superBeams, nowTick],
   );
+
+  const superBeamHudSeconds = useMemo(() => {
+    if (superBeamWarnings.length === 0) return null;
+    const tMin = Math.min(...superBeamWarnings.map((w) => w.impactAt));
+    return Math.max(0, Math.ceil((tMin - nowTick) / 1000));
+  }, [superBeamWarnings, nowTick]);
 
   const canPlay = activePlayers.length >= 2 && !winnerId;
   const canPlayWithRole = canPlay && combatRole !== null;
@@ -679,16 +741,16 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const jamActive = jamEndsAt > nowTick;
   const jamSecondsLeft = jamActive ? Math.max(0, Math.ceil((jamEndsAt - nowTick) / 1000)) : 0;
 
-  const placeSharedBeam = useCallback(async () => {
+  const placeSuperBeam = useCallback(async () => {
     if (!roster || winnerId || caught[playerId] || !canPlay) {
-      setScanDebug("Strahl: nur mit aktivem Raum / Spiel");
+      setScanDebug("Superstrahl: nur mit aktivem Raum / Spiel");
       return;
     }
     if (!myPos) {
-      setScanDebug("Strahl: GPS nötig (Standort aktivieren)");
+      setScanDebug("Superstrahl: GPS nötig (Standort aktivieren)");
       return;
     }
-    if (Date.now() < beamCooldownUntilRef.current) return;
+    if (Date.now() < superBeamCooldownUntilRef.current) return;
     try {
       const DOE = DeviceOrientationEvent as unknown as {
         requestPermission?: () => Promise<PermissionState>;
@@ -696,48 +758,95 @@ export function CatchGame({ roomId }: { roomId: string }) {
       if (typeof DOE.requestPermission === "function") {
         const p = await DOE.requestPermission();
         if (p !== "granted") {
-          setScanDebug("Strahl: „Bewegung & Ausrichtung“ erlauben (iOS)");
+          setScanDebug("Superstrahl: „Bewegung & Ausrichtung“ erlauben (iOS)");
           return;
         }
       }
     } catch {
-      setScanDebug("Strahl: Sensoren nicht verfügbar");
+      setScanDebug("Superstrahl: Sensoren nicht verfügbar");
       return;
     }
     const heading = orientationHeadingRef.current;
     if (heading === null || !Number.isFinite(heading)) {
-      setScanDebug("Strahl: Kompass kalibrieren / Handy kurz drehen");
+      setScanDebug("Superstrahl: Kompass kalibrieren / Handy kurz drehen");
       return;
     }
-    const end = destinationLatLng(myPos.lat, myPos.lng, heading, BEAM_LENGTH_M);
+    const end = destinationLatLng(
+      myPos.lat,
+      myPos.lng,
+      heading,
+      SUPER_BEAM_LENGTH_M,
+    );
+    const hitPlayerIds: string[] = [];
+    for (const pid of roster.sorted) {
+      if (pid === playerId) continue;
+      if (caught[pid]) continue;
+      let pos: { lat: number; lng: number } | null = null;
+      const p = positions[pid];
+      if (p && nowTick - p.ts < 45000) pos = { lat: p.lat, lng: p.lng };
+      if (!pos) continue;
+      if (
+        isPointInBeamCorridor(
+          pos.lat,
+          pos.lng,
+          myPos.lat,
+          myPos.lng,
+          end.lat,
+          end.lng,
+          SUPER_BEAM_HALF_WIDTH_M,
+        )
+      ) {
+        hitPlayerIds.push(pid);
+      }
+    }
     const ts = Date.now();
-    const beamId = `${playerId}-${ts}`;
-    beamCooldownUntilRef.current = ts + BEAM_COOLDOWN_MS;
-    setBeamCooldownActive(true);
+    const impactAt = ts + SUPER_BEAM_COUNTDOWN_MS;
+    const superBeamId = `sb-${playerId}-${ts}`;
+    superBeamCooldownUntilRef.current = ts + SUPER_BEAM_COOLDOWN_MS;
+    setSuperBeamCooldownActive(true);
     window.setTimeout(() => {
-      beamCooldownUntilRef.current = 0;
-      setBeamCooldownActive(false);
-    }, BEAM_COOLDOWN_MS);
+      superBeamCooldownUntilRef.current = 0;
+      setSuperBeamCooldownActive(false);
+    }, SUPER_BEAM_COOLDOWN_MS);
+
+    const corridor = beamGroundCorridor(
+      myPos.lat,
+      myPos.lng,
+      end.lat,
+      end.lng,
+      SUPER_BEAM_HALF_WIDTH_M,
+    );
+
     publish({
-      type: "shared_beam",
+      type: "super_beam",
       roomId: roomKey,
-      beamId,
+      superBeamId,
       casterPlayerId: playerId,
       originLat: myPos.lat,
       originLng: myPos.lng,
       endLat: end.lat,
       endLng: end.lng,
-      lengthM: BEAM_LENGTH_M,
+      lengthM: SUPER_BEAM_LENGTH_M,
+      halfWidthM: SUPER_BEAM_HALF_WIDTH_M,
+      hitPlayerIds,
+      impactAt,
       ts,
     });
-    setLaserFlashBeta(orientationBetaRef.current);
-    setLocalLaserFlash(true);
-    window.setTimeout(() => {
-      setLocalLaserFlash(false);
-      setLaserFlashBeta(null);
-    }, 1150);
-    setScanDebug("Roter Strahl geteilt – alle sehen ihn auf der Karte");
-  }, [roster, winnerId, caught, playerId, canPlay, myPos, roomKey, publish]);
+
+    setSuperBeams((prev) => {
+      if (prev.some((b) => b.id === superBeamId)) return prev;
+      return [
+        ...prev,
+        { id: superBeamId, casterId: playerId, corridor, ts },
+      ].slice(-24);
+    });
+
+    setScanDebug(
+      hitPlayerIds.length
+        ? `Superstrahl: ${hitPlayerIds.length} im Korridor – ${SUPER_BEAM_COUNTDOWN_MS / 1000}s Warnung`
+        : "Superstrahl auf Karte – niemand im Korridor",
+    );
+  }, [roster, winnerId, caught, playerId, canPlay, myPos, positions, nowTick, roomKey, publish]);
 
   const huntTagIds = useMemo(() => {
     if (!roster) return [];
@@ -758,7 +867,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
     lastTagHealPublishRef.current = {};
     tagHealVisualDebtRef.current = 0;
     processedWeaponHitIdsRef.current = [];
-    processedSharedBeamIdsRef.current = [];
+    processedSuperBeamMapIdsRef.current = [];
+    processedSuperBeamDamageIdsRef.current = [];
     fireHeldRef.current = false;
     aimVictimPlayerIdRef.current = null;
     window.queueMicrotask(() => setFirePressed(false));
@@ -766,9 +876,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setHpDisplay(MAX_HP);
       setHpFloaters([]);
       setAimHuntTagId(null);
-      setSharedBeams([]);
-      beamCooldownUntilRef.current = 0;
-      setBeamCooldownActive(false);
+      setSuperBeams([]);
+      setSuperBeamWarnings([]);
+      superBeamCooldownUntilRef.current = 0;
+      setSuperBeamCooldownActive(false);
       prevAimHuntTagRef.current = null;
     });
   }, [roster]);
@@ -991,6 +1102,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 ts: now,
               });
               vibrateOnWeaponFired("sniper", crit);
+              playWeaponFireSound("sniper", crit);
             }
           } else if (now - lastSemiShotAtRef.current >= SEMI_COOLDOWN_MS) {
             lastSemiShotAtRef.current = now;
@@ -1014,6 +1126,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               ts: now,
             });
             vibrateOnWeaponFired("semi", crit);
+            playWeaponFireSound("semi", crit);
           }
         }
 
@@ -1156,6 +1269,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
   return (
     <div className="relative flex min-h-[100dvh] flex-col bg-zinc-950 text-zinc-100">
       <HpDamageFloaters items={hpFloaters} />
+      {superBeamHudSeconds !== null && (
+        <div
+          className="pointer-events-none fixed inset-0 z-[2500] flex items-start justify-center px-4 pt-10 sm:pt-16"
+          role="alert"
+          aria-live="assertive"
+        >
+          <div className="max-w-lg rounded-2xl border-2 border-amber-500 bg-black/90 px-5 py-4 text-center shadow-[0_0_48px_rgba(245,158,11,0.45)] sm:px-8 sm:py-6">
+            <p className="text-base font-black uppercase leading-tight tracking-wide text-amber-400 sm:text-lg">
+              {SUPER_BEAM_WARNING_LINES}
+            </p>
+            <p className="mt-4 text-6xl font-black tabular-nums text-red-500 sm:text-7xl">
+              {superBeamHudSeconds}
+            </p>
+          </div>
+        </div>
+      )}
       {showLocationModal && (
         <div
           className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
@@ -1441,7 +1570,6 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 </>
               )}
             </div>
-            <CameraLaserOverlay active={localLaserFlash} betaDeg={laserFlashBeta} />
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
             {aimHuntTagId !== null && canPlayWithRole && !winnerId && roster && combatRole && (
               <div className="pointer-events-none absolute left-1/2 top-1/2 z-[32] -translate-x-1/2 -translate-y-[120%]">
@@ -1486,19 +1614,22 @@ export function CatchGame({ roomId }: { roomId: string }) {
             {canPlayWithRole && !winnerId && roster && (
               <div className="absolute bottom-0 left-0 right-0 z-[30] flex flex-col gap-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
                 {locationConsent === true && gpsOk && myPos && (
-                  <div className="pointer-events-auto mx-3 rounded-xl border border-red-900/50 bg-zinc-950/90 p-2.5 shadow-lg backdrop-blur-md">
+                  <div className="pointer-events-auto mx-3 rounded-xl border border-amber-800/60 bg-zinc-950/90 p-2.5 shadow-lg backdrop-blur-md">
                     <button
                       type="button"
-                      onClick={() => void placeSharedBeam()}
-                      disabled={beamCooldownActive}
-                      className="w-full rounded-lg bg-gradient-to-b from-red-700 to-red-900 py-2.5 text-sm font-bold text-white shadow-md transition enabled:active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45"
+                      onClick={() => void placeSuperBeam()}
+                      disabled={superBeamCooldownActive}
+                      className="w-full rounded-lg bg-gradient-to-b from-amber-600 to-orange-800 py-2.5 text-sm font-bold text-white shadow-md transition enabled:active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45"
                     >
-                      Roter Strahl teilen
+                      Superstrahl ({SUPER_BEAM_LENGTH_M} m × {SUPER_BEAM_HALF_WIDTH_M * 2} m)
                     </button>
                     <p className="mt-1.5 text-center text-[10px] leading-snug text-zinc-400">
-                      Fadenkreuz = Blickachse · GPS + Kompass ·{" "}
-                      <strong className="text-zinc-300">{BEAM_LENGTH_M} m</strong> auf der{" "}
-                      <strong className="text-zinc-300">Karte</strong> für alle im Raum
+                      Fadenkreuz = Blickachse · GPS + Kompass · trifft Mitspieler mit aktuellem GPS im{" "}
+                      <strong className="text-amber-200/90">{SUPER_BEAM_LENGTH_M}×{SUPER_BEAM_HALF_WIDTH_M * 2} m</strong>
+                      -Korridor ·{" "}
+                      <strong className="text-amber-200/90">{SUPER_BEAM_COUNTDOWN_MS / 1000} s</strong> Warnung, dann{" "}
+                      <strong className="text-rose-300">{STORM_HP_DAMAGE} HP</strong> · Abklingzeit{" "}
+                      {SUPER_BEAM_COOLDOWN_MS / 1000} s · auf der Karte sichtbar
                     </p>
                   </div>
                 )}
@@ -1623,7 +1754,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
               stormMode={stormMode}
               onStormPlace={handleStormPlace}
               stormCircles={stormCircles}
-              sharedBeams={visibleSharedBeams}
+              superBeams={visibleSuperBeams}
             />
           </div>
           <p className="text-xs text-zinc-500">
@@ -1646,8 +1777,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
             <strong className="text-zinc-400">Spieler 1</strong> (weniger Kacheln, schneller Laden).
             Ohne Spieler-1-Position startet die Ansicht mit ~<strong className="text-zinc-400">10 km</strong>{" "}
             um dich; „Zu mir (10 km)“ zentriert wieder auf dich.{" "}
-            <strong className="text-zinc-400">Roter Strahl:</strong> in der Kamera platzieren, Linie für
-            alle ~{Math.round(BEAM_TTL_MS / 1000)} s.
+            <strong className="text-zinc-400">Superstrahl:</strong> in der{" "}
+            <strong className="text-zinc-400">Kamera</strong> auslösen (
+            {SUPER_BEAM_LENGTH_M}×{SUPER_BEAM_HALF_WIDTH_M * 2} m), für alle auf der Karte ~
+            {Math.round(SUPER_BEAM_MAP_TTL_MS / 1000)} s.
           </p>
         </div>
       </div>
