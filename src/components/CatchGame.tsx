@@ -17,7 +17,13 @@ import { HpDamageFloaters } from "@/components/HpDamageFloaters";
 import type { StormCircle, SuperBeamLine } from "@/components/GameMapView";
 import type { GameMessage } from "@/lib/gameTypes";
 import { parseGameMessage } from "@/lib/gameTypes";
-import { beamGroundCorridor, compassHeadingFromEvent } from "@/lib/beamGeo";
+import {
+  beamGroundCorridor,
+  compassHeadingFromEvent,
+  destinationLatLng,
+  isPointInBeamCorridor,
+} from "@/lib/beamGeo";
+import { haversineMeters } from "@/lib/geo";
 import { getOrCreatePlayerId } from "@/lib/playerId";
 import {
   playWeaponFireSound,
@@ -45,6 +51,8 @@ type RosterInfo = {
 
 const LOCATION_STORAGE_KEY = "catch-game-use-location";
 const STORM_HP_DAMAGE = 500;
+const STORM_RADIUS_M = 5000;
+const STORM_COOLDOWN_MS = 25_000;
 const DRONE_JAM_DURATION_MS = 20_000;
 const DRONE_JAM_COOLDOWN_MS = 35_000;
 
@@ -64,7 +72,11 @@ const HEAL_PER_SEC = 25;
 const HEAL_FLOATER_CHUNK = 25;
 const TAG_LOCK_TTL_MS = 450;
 const TAG_LOCK_PUBLISH_INTERVAL_MS = 100;
-/** Superstrahl: 20 m Länge, 10 m Gesamtbreite (halbe Breite 5 m). */
+/** Luftangriff (Superstrahl): 20 m Länge, 10 m Gesamtbreite (halbe Breite 5 m). */
+const SUPER_BEAM_LENGTH_M = 20;
+const SUPER_BEAM_HALF_WIDTH_M = 5;
+const SUPER_BEAM_COUNTDOWN_MS = 3000;
+const SUPER_BEAM_COOLDOWN_MS = 42_000;
 const SUPER_BEAM_MAP_TTL_MS = 90_000;
 const SUPER_BEAM_WARNING_LINES =
   "WARNING, WARNING WARNING STORM IS COMING" as const;
@@ -137,6 +149,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [gpsOk, setGpsOk] = useState<boolean | null>(null);
   const [locationDenied, setLocationDenied] = useState(false);
   const [stormCircles, setStormCircles] = useState<StormCircle[]>([]);
+  const [stormMode, setStormMode] = useState(false);
+  const [stormCooldownUntil, setStormCooldownUntil] = useState(0);
   const [droneJamCooldownUntil, setDroneJamCooldownUntil] = useState(0);
   /** Ende der Störung (ms seit Epoch); 0 = keine aktive Störung. */
   const [jamEndsAt, setJamEndsAt] = useState(0);
@@ -153,6 +167,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const [dmgCritPercent, setDmgCritPercent] = useState(DMG_CRIT_PCT_MIN);
   const [firePressed, setFirePressed] = useState(false);
   const [superBeams, setSuperBeams] = useState<SuperBeamLine[]>([]);
+  const [superBeamCooldownActive, setSuperBeamCooldownActive] = useState(false);
   const [superBeamWarnings, setSuperBeamWarnings] = useState<
     Array<{ id: string; impactAt: number }>
   >([]);
@@ -190,6 +205,7 @@ export function CatchGame({ roomId }: { roomId: string }) {
   >(() => {});
   const prevAimHuntTagRef = useRef<number | null>(null);
   const combatRoleRef = useRef<CombatRole | null>(null);
+  const superBeamCooldownUntilRef = useRef(0);
 
   const getVideo = useCallback(() => webcamRef.current?.video ?? null, []);
 
@@ -360,6 +376,62 @@ export function CatchGame({ roomId }: { roomId: string }) {
       });
     },
     [roomKey],
+  );
+
+  const handleStormPlace = useCallback(
+    (lat: number, lng: number) => {
+      setStormMode(false);
+      if (Date.now() < stormCooldownUntil) return;
+      if (!combatRole) return;
+      if (!roster) return;
+
+      const center = { lat, lng };
+      const hitPlayerIds: string[] = [];
+      for (const pid of roster.sorted) {
+        if (caught[pid]) continue;
+        let pos: { lat: number; lng: number } | null = null;
+        if (pid === playerId) pos = myPos;
+        else {
+          const p = positions[pid];
+          if (p && nowTick - p.ts < 45000) pos = { lat: p.lat, lng: p.lng };
+        }
+        if (!pos) continue;
+        if (haversineMeters(center, pos) <= STORM_RADIUS_M) hitPlayerIds.push(pid);
+      }
+
+      const ts = Date.now();
+      const stormEventId = `${playerId}-${ts}`;
+      setStormCooldownUntil(ts + STORM_COOLDOWN_MS);
+
+      publish({
+        type: "storm",
+        roomId: roomKey,
+        stormEventId,
+        lat,
+        lng,
+        radiusM: STORM_RADIUS_M,
+        casterPlayerId: playerId,
+        hitPlayerIds,
+        ts,
+      });
+
+      setStormCircles((prev) => {
+        if (prev.some((s) => s.id === stormEventId)) return prev;
+        return [...prev, { id: stormEventId, lat, lng, radiusM: STORM_RADIUS_M }].slice(-12);
+      });
+    },
+    [
+      stormCooldownUntil,
+      combatRole,
+      roster,
+      caught,
+      playerId,
+      myPos,
+      positions,
+      nowTick,
+      roomKey,
+      publish,
+    ],
   );
 
   useEffect(() => {
@@ -634,6 +706,15 @@ export function CatchGame({ roomId }: { roomId: string }) {
   const canPlay = activePlayers.length >= 2 && !winnerId;
   const canPlayWithRole = canPlay && combatRole !== null;
   const iAmCaught = Boolean(playerId && caught[playerId]);
+  const stormOnCooldown = nowTick < stormCooldownUntil;
+
+  const startStormMode = useCallback(() => {
+    if (!canPlayWithRole || iAmCaught || winnerId) return;
+    if (Date.now() < stormCooldownUntil) return;
+    setView("map");
+    setStormMode(true);
+  }, [canPlayWithRole, iAmCaught, winnerId, stormCooldownUntil]);
+
   const sendDroneJam = useCallback(() => {
     if (!canPlayWithRole || iAmCaught || winnerId) return;
     if (nowTick < droneJamCooldownUntil) return;
@@ -672,6 +753,113 @@ export function CatchGame({ roomId }: { roomId: string }) {
       .filter((n) => Number.isFinite(n));
   }, [roster, playerId, caught]);
 
+  const placeSuperBeam = useCallback(async () => {
+    if (!roster || winnerId || caught[playerId] || !canPlay) {
+      setScanDebug("Luftangriff: nur mit aktivem Raum / Spiel");
+      return;
+    }
+    if (!myPos) {
+      setScanDebug("Luftangriff: GPS nötig (Standort aktivieren)");
+      return;
+    }
+    if (Date.now() < superBeamCooldownUntilRef.current) return;
+    try {
+      const DOE = DeviceOrientationEvent as unknown as {
+        requestPermission?: () => Promise<PermissionState>;
+      };
+      if (typeof DOE.requestPermission === "function") {
+        const p = await DOE.requestPermission();
+        if (p !== "granted") {
+          setScanDebug("Luftangriff: „Bewegung & Ausrichtung“ erlauben (iOS)");
+          return;
+        }
+      }
+    } catch {
+      setScanDebug("Luftangriff: Sensoren nicht verfügbar");
+      return;
+    }
+    const heading = orientationHeadingRef.current;
+    if (heading === null || !Number.isFinite(heading)) {
+      setScanDebug("Luftangriff: Kompass kalibrieren / Handy kurz drehen");
+      return;
+    }
+    const end = destinationLatLng(
+      myPos.lat,
+      myPos.lng,
+      heading,
+      SUPER_BEAM_LENGTH_M,
+    );
+    const hitPlayerIds: string[] = [];
+    for (const pid of roster.sorted) {
+      if (pid === playerId) continue;
+      if (caught[pid]) continue;
+      let pos: { lat: number; lng: number } | null = null;
+      const p = positions[pid];
+      if (p && nowTick - p.ts < 45000) pos = { lat: p.lat, lng: p.lng };
+      if (!pos) continue;
+      if (
+        isPointInBeamCorridor(
+          pos.lat,
+          pos.lng,
+          myPos.lat,
+          myPos.lng,
+          end.lat,
+          end.lng,
+          SUPER_BEAM_HALF_WIDTH_M,
+        )
+      ) {
+        hitPlayerIds.push(pid);
+      }
+    }
+    const ts = Date.now();
+    const impactAt = ts + SUPER_BEAM_COUNTDOWN_MS;
+    const superBeamId = `sb-${playerId}-${ts}`;
+    superBeamCooldownUntilRef.current = ts + SUPER_BEAM_COOLDOWN_MS;
+    setSuperBeamCooldownActive(true);
+    window.setTimeout(() => {
+      superBeamCooldownUntilRef.current = 0;
+      setSuperBeamCooldownActive(false);
+    }, SUPER_BEAM_COOLDOWN_MS);
+
+    const corridor = beamGroundCorridor(
+      myPos.lat,
+      myPos.lng,
+      end.lat,
+      end.lng,
+      SUPER_BEAM_HALF_WIDTH_M,
+    );
+
+    publish({
+      type: "super_beam",
+      roomId: roomKey,
+      superBeamId,
+      casterPlayerId: playerId,
+      originLat: myPos.lat,
+      originLng: myPos.lng,
+      endLat: end.lat,
+      endLng: end.lng,
+      lengthM: SUPER_BEAM_LENGTH_M,
+      halfWidthM: SUPER_BEAM_HALF_WIDTH_M,
+      hitPlayerIds,
+      impactAt,
+      ts,
+    });
+
+    setSuperBeams((prev) => {
+      if (prev.some((b) => b.id === superBeamId)) return prev;
+      return [
+        ...prev,
+        { id: superBeamId, casterId: playerId, corridor, ts },
+      ].slice(-24);
+    });
+
+    setScanDebug(
+      hitPlayerIds.length
+        ? `Luftangriff: ${hitPlayerIds.length} im Korridor – ${SUPER_BEAM_COUNTDOWN_MS / 1000}s Warnung`
+        : "Luftangriff auf Karte – niemand im Korridor",
+    );
+  }, [roster, winnerId, caught, playerId, canPlay, myPos, positions, nowTick, roomKey, publish]);
+
   useEffect(() => {
     if (roster) return;
     hpRef.current = MAX_HP;
@@ -694,6 +882,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
       setAimHuntTagId(null);
       setSuperBeams([]);
       setSuperBeamWarnings([]);
+      superBeamCooldownUntilRef.current = 0;
+      setSuperBeamCooldownActive(false);
       prevAimHuntTagRef.current = null;
     });
   }, [roster]);
@@ -1165,7 +1355,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
             </h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-300">
               Mit dem AprilTag wirkt du auf andere Spieler.{" "}
-              <strong className="text-zinc-100">Schaden</strong>: Ziel im Visierpunkt, dann{" "}
+              <strong className="text-zinc-100">Schaden</strong>: Ziel im Fadenkreuz (Sniper) bzw. Rotpunkt
+              (Halbauto), dann{" "}
               <strong className="text-red-300">Feuer halten</strong> –{" "}
               <strong className="text-rose-300">Sniper</strong>{" "}
               {SNIPER_DMG_MIN}–{SNIPER_DMG_MAX} HP alle {SNIPER_COOLDOWN_MS / 1000}s,{" "}
@@ -1381,12 +1572,18 @@ export function CatchGame({ roomId }: { roomId: string }) {
               className="pointer-events-none absolute inset-0 z-[15] flex items-center justify-center"
               aria-hidden
             >
-              {combatRole === "dmg" && (
+              {combatRole === "dmg" && weaponChoice === "semi" ? (
                 <div
                   className="absolute left-1/2 top-1/2 size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500 shadow-[0_0_4px_#fff,0_0_10px_rgba(239,68,68,1),0_0_22px_rgba(220,38,38,0.65)] ring-[2px] ring-red-950/50"
-                  aria-label="Visierpunkt"
+                  aria-label="Rotpunktvisier"
                 />
-              )}
+              ) : combatRole === "dmg" ? (
+                <>
+                  <div className="absolute left-1/2 top-0 bottom-0 w-[2px] -translate-x-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                  <div className="absolute top-1/2 left-0 right-0 h-[2px] -translate-y-1/2 bg-white/75 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                  <div className="absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 shadow-[0_0_6px_rgba(0,0,0,0.85)]" />
+                </>
+              ) : null}
             </div>
             <DroneJamOverlay active={jamActive} secondsLeft={jamSecondsLeft} />
             {aimHuntTagId !== null && canPlayWithRole && !winnerId && roster && combatRole && (
@@ -1417,7 +1614,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
                       combatRole === "heal" ? "text-emerald-200/85" : "text-rose-200/85"
                     }`}
                   >
-                    {combatRole === "dmg" ? "Im Visierpunkt · " : ""}
+                    {combatRole === "dmg" && weaponChoice === "semi"
+                      ? "Im Rotpunkt · "
+                      : combatRole === "dmg"
+                        ? "Im Fadenkreuz · "
+                        : ""}
                     {combatRole === "heal"
                       ? `Heilung +${HEAL_PER_SEC} HP/s`
                       : weaponChoice === "sniper"
@@ -1427,67 +1628,86 @@ export function CatchGame({ roomId }: { roomId: string }) {
                 </div>
               </div>
             )}
-            {canPlayWithRole && !winnerId && roster && combatRole === "dmg" && (
-              <div className="absolute bottom-0 left-0 right-0 z-[30] pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-                <div className="pointer-events-auto mx-2 flex flex-col gap-1.5 rounded-lg border border-rose-800/60 bg-zinc-950/88 p-2 shadow-lg backdrop-blur-sm">
-                  <div className="flex gap-1.5">
+            {canPlayWithRole && !winnerId && roster && (
+              <div className="absolute bottom-0 left-0 right-0 z-[30] flex flex-col gap-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+                {locationConsent === true && gpsOk && myPos && (
+                  <div className="pointer-events-auto mx-2 rounded-lg border border-amber-800/60 bg-zinc-950/90 p-2 shadow-lg backdrop-blur-md">
                     <button
                       type="button"
-                      onClick={() => pickWeapon("sniper")}
-                      className={`flex-1 rounded-md border px-1.5 py-2 text-center text-[10px] font-semibold leading-tight transition sm:text-[11px] ${
-                        weaponChoice === "sniper"
-                          ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_12px_rgba(225,29,72,0.3)]"
-                          : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
-                      }`}
+                      onClick={() => void placeSuperBeam()}
+                      disabled={superBeamCooldownActive}
+                      className="w-full rounded-md bg-gradient-to-b from-amber-600 to-orange-800 py-2 text-xs font-bold text-white shadow-md transition enabled:active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-45 sm:text-sm"
                     >
-                      Sniper
+                      Luftangriff ({SUPER_BEAM_LENGTH_M} m × {SUPER_BEAM_HALF_WIDTH_M * 2} m)
                     </button>
+                    <p className="mt-1 text-center text-[9px] leading-snug text-zinc-400 sm:text-[10px]">
+                      Fadenkreuz = Blickachse · GPS + Kompass ·{" "}
+                      <strong className="text-amber-200/90">{SUPER_BEAM_COUNTDOWN_MS / 1000} s</strong>{" "}
+                      Warnung, dann <strong className="text-rose-300">{STORM_HP_DAMAGE} HP</strong>
+                    </p>
+                  </div>
+                )}
+                {combatRole === "dmg" && (
+                  <div className="pointer-events-auto mx-2 flex flex-col gap-1.5 rounded-lg border border-rose-800/60 bg-zinc-950/88 p-2 shadow-lg backdrop-blur-sm">
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => pickWeapon("sniper")}
+                        className={`flex-1 rounded-md border px-1.5 py-2 text-center text-[10px] font-semibold leading-tight transition sm:text-[11px] ${
+                          weaponChoice === "sniper"
+                            ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_12px_rgba(225,29,72,0.3)]"
+                            : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
+                        }`}
+                      >
+                        Sniper
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => pickWeapon("semi")}
+                        className={`flex-1 rounded-md border px-1.5 py-2 text-center text-[10px] font-semibold leading-tight transition sm:text-[11px] ${
+                          weaponChoice === "semi"
+                            ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_12px_rgba(225,29,72,0.3)]"
+                            : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
+                        }`}
+                      >
+                        Halbauto
+                      </button>
+                    </div>
                     <button
                       type="button"
-                      onClick={() => pickWeapon("semi")}
-                      className={`flex-1 rounded-md border px-1.5 py-2 text-center text-[10px] font-semibold leading-tight transition sm:text-[11px] ${
-                        weaponChoice === "semi"
-                          ? "border-rose-400 bg-rose-700 text-white shadow-[0_0_12px_rgba(225,29,72,0.3)]"
-                          : "border-zinc-600 bg-zinc-800/90 text-zinc-300 hover:border-zinc-500"
+                      className={`min-h-12 touch-manipulation select-none rounded-lg border-2 border-rose-500/80 bg-gradient-to-b from-rose-600 to-rose-800 px-3 py-2.5 text-base font-black uppercase tracking-wide text-white shadow-md transition active:scale-[0.98] sm:min-h-14 sm:text-lg ${
+                        firePressed ? "ring-2 ring-amber-300/90 ring-offset-1 ring-offset-zinc-950" : ""
                       }`}
+                      style={{ WebkitUserSelect: "none" }}
+                      onPointerDown={(e) => {
+                        unlockWeaponAudioFromUserGesture();
+                        e.preventDefault();
+                        fireHeldRef.current = true;
+                        setFirePressed(true);
+                        try {
+                          (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
+                        } catch {
+                          /* */
+                        }
+                      }}
+                      onPointerUp={(e) => {
+                        fireHeldRef.current = false;
+                        setFirePressed(false);
+                        try {
+                          (e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
+                        } catch {
+                          /* */
+                        }
+                      }}
+                      onPointerLeave={() => {
+                        fireHeldRef.current = false;
+                        setFirePressed(false);
+                      }}
                     >
-                      Halbauto
+                      Feuer halten
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    className={`min-h-12 touch-manipulation select-none rounded-lg border-2 border-rose-500/80 bg-gradient-to-b from-rose-600 to-rose-800 px-3 py-2.5 text-base font-black uppercase tracking-wide text-white shadow-md transition active:scale-[0.98] sm:min-h-14 sm:text-lg ${
-                      firePressed ? "ring-2 ring-amber-300/90 ring-offset-1 ring-offset-zinc-950" : ""
-                    }`}
-                    style={{ WebkitUserSelect: "none" }}
-                    onPointerDown={(e) => {
-                      unlockWeaponAudioFromUserGesture();
-                      e.preventDefault();
-                      fireHeldRef.current = true;
-                      setFirePressed(true);
-                      try {
-                        (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
-                      } catch {
-                        /* */
-                      }
-                    }}
-                    onPointerUp={(e) => {
-                      fireHeldRef.current = false;
-                      setFirePressed(false);
-                      try {
-                        (e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
-                      } catch {
-                        /* */
-                      }
-                    }}
-                    onPointerLeave={() => {
-                      fireHeldRef.current = false;
-                      setFirePressed(false);
-                    }}
-                  >
-                    Feuer halten
-                  </button>
-                </div>
+                )}
               </div>
             )}
           </div>
@@ -1501,14 +1721,28 @@ export function CatchGame({ roomId }: { roomId: string }) {
           }
           aria-hidden={view !== "map"}
         >
+          {stormMode && (
+            <div className="rounded-lg border border-orange-700/70 bg-orange-950/90 px-3 py-2 text-sm text-orange-100">
+              <strong>Feuersturm:</strong> Tippe auf die Karte für einen Kreis mit 5&nbsp;km Radius.
+              Getroffene Spieler verlieren <strong className="text-orange-200">{STORM_HP_DAMAGE} HP</strong>
+              ; bei 0 HP sind sie gefangen.{" "}
+              <button
+                type="button"
+                className="ml-1 underline decoration-orange-400 hover:text-white"
+                onClick={() => setStormMode(false)}
+              >
+                Abbrechen
+              </button>
+            </div>
+          )}
           <div className="min-h-[320px] flex-1 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-inner">
             <GameMapView
               myPlayerId={playerId}
               myPos={myPos}
               others={othersOnMap}
               playerOnePos={playerOnePos}
-              stormMode={false}
-              onStormPlace={() => {}}
+              stormMode={stormMode}
+              onStormPlace={handleStormPlace}
               stormCircles={stormCircles}
               superBeams={visibleSuperBeams}
             />
@@ -1532,9 +1766,11 @@ export function CatchGame({ roomId }: { roomId: string }) {
             <strong className="text-zinc-400">35 km</strong> um{" "}
             <strong className="text-zinc-400">Spieler 1</strong> (weniger Kacheln, schneller Laden).
             Ohne Spieler-1-Position startet die Ansicht mit ~<strong className="text-zinc-400">10 km</strong>{" "}
-            um dich; „Zu mir (10 km)“ zentriert wieder auf dich. Aktive{" "}
-            <strong className="text-zinc-400">Superstrahlen</strong> erscheinen als orangefarbene Fläche (~
-            {Math.round(SUPER_BEAM_MAP_TTL_MS / 1000)} s).
+            um dich; „Zu mir (10 km)“ zentriert wieder auf dich.{" "}
+            <strong className="text-zinc-400">Luftangriff</strong> in der{" "}
+            <strong className="text-zinc-400">Kamera</strong> (
+            {SUPER_BEAM_LENGTH_M}×{SUPER_BEAM_HALF_WIDTH_M * 2} m), auf der Karte ~{" "}
+            {Math.round(SUPER_BEAM_MAP_TTL_MS / 1000)} s sichtbar.
           </p>
         </div>
       </div>
@@ -1544,6 +1780,25 @@ export function CatchGame({ roomId }: { roomId: string }) {
           Spezialaktionen <span className="text-zinc-400">(ganz unten, über Karte/Kamera)</span>
         </p>
         <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={startStormMode}
+            disabled={!canPlayWithRole || iAmCaught || !!winnerId || stormOnCooldown}
+            title={
+              !combatRole && !winnerId
+                ? "Zuerst Rolle wählen (Dialog oben)."
+                : !canPlay && !winnerId
+                  ? "Ab zwei Spielern im Raum nutzbar."
+                  : stormOnCooldown
+                    ? `Feuersturm abklingend (${Math.ceil((stormCooldownUntil - nowTick) / 1000)} s)`
+                    : "Karte öffnen und Kreis mit 5 km Radius setzen."
+            }
+            className="w-full rounded-lg border border-transparent px-4 py-3 text-sm font-medium transition enabled:border-orange-500/50 enabled:bg-gradient-to-b enabled:from-orange-600 enabled:to-red-900 enabled:text-white enabled:hover:from-orange-500 enabled:hover:to-red-800 disabled:cursor-not-allowed disabled:border-orange-950/60 disabled:bg-orange-950/40 disabled:text-orange-200/70"
+          >
+            {stormOnCooldown
+              ? `Feuersturm (${Math.max(0, Math.ceil((stormCooldownUntil - nowTick) / 1000))} s)`
+              : "Feuersturm"}
+          </button>
           <button
             type="button"
             onClick={sendDroneJam}
@@ -1577,7 +1832,10 @@ export function CatchGame({ roomId }: { roomId: string }) {
             </button>
             <button
               type="button"
-              onClick={() => setView("camera")}
+              onClick={() => {
+                setStormMode(false);
+                setView("camera");
+              }}
               className={`flex-1 rounded-lg px-4 py-3 text-sm font-medium transition ${
                 view === "camera"
                   ? "bg-blue-600 text-white"
@@ -1598,8 +1856,8 @@ export function CatchGame({ roomId }: { roomId: string }) {
           )}
           {!canPlay && !winnerId && (
             <p className="text-amber-200/80">
-              <strong className="text-amber-100">Drohnen-Störung:</strong> orangefarbener Button oben in
-              dieser Leiste – er wird erst <strong className="text-amber-50">klickbar</strong>, wenn
+              <strong className="text-amber-100">Feuersturm, Drohnen-Störung:</strong> Buttons oben in
+              dieser Leiste – sie werden erst <strong className="text-amber-50">klickbar</strong>, wenn
               mindestens <strong className="text-amber-50">zwei Spieler</strong> online sind (gleicher
               Raumcode).
             </p>
